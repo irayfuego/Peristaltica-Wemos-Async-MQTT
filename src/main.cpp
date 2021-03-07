@@ -302,13 +302,39 @@ void emergencyStopTriggerdCallbackFunction ()
         }
       }
     }	
+
+  int progressStop;
+
+  if (StepperStopped == 1){
+      long CurrentSteps1;
+      CurrentSteps1 = stepper1.getCurrentPositionInSteps() ;
+      progressStop = round(100 * (CurrentSteps1 - InitialSteps1)/(TargetSteps1 - InitialSteps1));
+
         
+  }
+  else if (StepperStopped == 2){
+      long CurrentSteps2;
+      CurrentSteps2 = stepper2.getCurrentPositionInSteps() ;
+      progressStop = round(100 * (CurrentSteps2 - InitialSteps2)/(TargetSteps2 - InitialSteps2));
+
+  }
+  else if (StepperStopped == 3){    
+      long CurrentSteps3;
+      CurrentSteps3 = stepper3.getCurrentPositionInSteps() ;
+      progressStop = round(100 * (CurrentSteps3 - InitialSteps3)/(TargetSteps3 - InitialSteps3));
+
+  }
+
+
+
+
+
     char tempJsonStringDone[256];    
     StaticJsonDocument<256> ResponseDone;
     ResponseDone["type"] = "done";
     ResponseDone["action"] = "stop";
     ResponseDone["channel"] = StepperStopped;
-    ResponseDone["progress"] = 100;  
+    ResponseDone["progress"] = progressStop;  
 
     size_t n = serializeJson(ResponseDone, tempJsonStringDone);    
     mqtt_client.publish("peristaltica/status", tempJsonStringDone, n);
@@ -340,8 +366,8 @@ void checkProgress()
       Response1["channel"] = 1;
       Response1["progress"] = Progress1;
       char tempJsonString1[256];
-      size_t n = serializeJson(Response1, tempJsonString1);    
-      mqtt_client.publish("peristaltica/status", tempJsonString1, n);
+      size_t n1 = serializeJson(Response1, tempJsonString1);    
+      mqtt_client.publish("peristaltica/status", tempJsonString1, n1);
 
     }
 
@@ -358,8 +384,8 @@ void checkProgress()
       Response2["channel"] = 2;
       Response2["progress"] = Progress2;
       char tempJsonString2[256];
-      size_t n = serializeJson(Response2, tempJsonString2);    
-      mqtt_client.publish("peristaltica/status", tempJsonString2, n);
+      size_t n2 = serializeJson(Response2, tempJsonString2);    
+      mqtt_client.publish("peristaltica/status", tempJsonString2, n2);
 
     }
 
@@ -373,11 +399,11 @@ void checkProgress()
       StaticJsonDocument<256> Response3;
       Response3["type"] = "running";
       Response3["action"] = "run";
-      Response3["channel"] = 1;
+      Response3["channel"] = 3;
       Response3["progress"] = Progress3;
       char tempJsonString3[256];
-      size_t n = serializeJson(Response3, tempJsonString3);    
-      mqtt_client.publish("peristaltica/status", tempJsonString3, n);
+      size_t n3 = serializeJson(Response3, tempJsonString3);    
+      mqtt_client.publish("peristaltica/status", tempJsonString3, n3);
 
     }
 
