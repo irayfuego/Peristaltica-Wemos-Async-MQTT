@@ -29,9 +29,7 @@ PubSubClient mqtt_client(espClient);
 StaticJsonDocument<256> FeedbackData;
 String DataJSONWeb ="";
 StaticJsonDocument<256> JSONReceived;
-StaticJsonDocument<256> MessageChannel1;
-StaticJsonDocument<256> MessageChannel2;
-StaticJsonDocument<256> MessageChannel3;
+
 
 // ---------------------- SPECIFIC DEFINITIONS FOR SENSORS IN THIS PROJECT -----------------------------------
 
@@ -50,24 +48,24 @@ int EnableStepper = 12;            //enable-low or disable-high stepper drivers
 //*********Declaring Variables ************************************//
 const char* Action;
 int Channel;
-float VolumeMl;
 float VolumeMl1;
 float VolumeMl2;
 float VolumeMl3;
-float SpeedMlperMin;
 float SpeedMlperMin1;
 float SpeedMlperMin2;
 float SpeedMlperMin3;
-const char* Direction;
 const char* Direction1;
 const char* Direction2;
 const char* Direction3;
-long StepsPerMl;
 long StepsPerMili1;
 long StepsPerMili2;
 long StepsPerMili3;
-long StepsToMove;
-long SpeedToMove;
+long StepsToMove1;
+long StepsToMove2;
+long StepsToMove3;
+long SpeedToMove1;
+long SpeedToMove2;
+long SpeedToMove3;
 long InitialSteps1;
 long InitialSteps2;
 long InitialSteps3;
@@ -326,9 +324,6 @@ void emergencyStopTriggerdCallbackFunction ()
   }
 
 
-
-
-
     char tempJsonStringDone[256];    
     StaticJsonDocument<256> ResponseDone;
     ResponseDone["type"] = "done";
@@ -419,34 +414,53 @@ void ParseJSONMessage()
   Action = JSONReceived["action"];
   if (String(Action) == "run"){
       Channel = JSONReceived["channel"];
-      VolumeMl = JSONReceived["volume"];
-      SpeedMlperMin = JSONReceived["speed"];
-      Direction = JSONReceived["direction"];
+      switch (Channel) {
+        case 1:
+          VolumeMl1 = JSONReceived["volume"];
+          SpeedMlperMin1 = JSONReceived["speed"];
+          Direction1 = JSONReceived["direction"];
+
+          break;
+        case 2:
+          VolumeMl2 = JSONReceived["volume"];
+          SpeedMlperMin2 = JSONReceived["speed"];
+          Direction2 = JSONReceived["direction"];
+          break;
+        case 3:
+          VolumeMl3 = JSONReceived["volume"];
+          SpeedMlperMin3 = JSONReceived["speed"];
+          Direction3 = JSONReceived["direction"];
+          break;
+        default:
+          //
+          break;
+      }
         
   }
   else if (String(Action) == "calibrate"){
+      
       Channel = JSONReceived["channel"];
-      StepsPerMl = JSONReceived["stepsperml"];
+      switch (Channel) {
+        case 1:
+          StepsPerMili1 = JSONReceived["stepsperml"];
+          break;
+        case 2:
+          StepsPerMili2 = JSONReceived["stepsperml"];
+          break;
+        case 3:
+          StepsPerMili3 = JSONReceived["stepsperml"];
+          break;
+        default:
+          //
+          break;
+      }
+      
+      
         
   }
   else if (String(Action) == "stop"){
       Channel = JSONReceived["channel"];              
 
-  }
-
-  switch (Channel) {
-    case 1:
-      MessageChannel1 = JSONReceived;
-      break;
-    case 2:
-      MessageChannel2 = JSONReceived;
-      break;
-    case 3:
-      MessageChannel3 = JSONReceived;
-      break;
-    default:
-      //
-      break;
   }
 
 
@@ -455,53 +469,50 @@ void ParseJSONMessage()
 
 void CallAction ()
 {
-  if (String(Action) == "run"){
-      if (String(Direction) == "ccw"){
-          VolumeMl = - VolumeMl; // If counterclockwise movement then the relative steps to move the stepper need to be negative
-      }      
+  if (String(Action) == "run"){ 
     
       digitalWrite(EnableStepper, LOW);
      
      if (Channel == 1){
-
-        SpeedMlperMin1 = SpeedMlperMin;
-        VolumeMl1 = VolumeMl;
-        Direction1 = Direction;     
-        SpeedToMove = round(SpeedMlperMin * StepsPerMili1 / 60); //steps per second
-        StepsToMove =   VolumeMl * StepsPerMili1;
+  
+        if (String(Direction1) == "ccw"){
+            VolumeMl1 = - VolumeMl1;
+        }  
+        SpeedToMove1 = round(SpeedMlperMin1 * StepsPerMili1 / 60); //steps per second
+        StepsToMove1 =   VolumeMl1 * StepsPerMili1;
         Stepper1Running = true;
-        stepper1.setSpeedInStepsPerSecond(SpeedToMove);
-        stepper1.setTargetPositionRelativeInSteps(StepsToMove);
+        stepper1.setSpeedInStepsPerSecond(SpeedToMove1);
+        stepper1.setTargetPositionRelativeInSteps(StepsToMove1);
         InitialSteps1 = stepper1.getCurrentPositionInSteps() ;
-        TargetSteps1 = InitialSteps1 + StepsToMove;
+        TargetSteps1 = InitialSteps1 + StepsToMove1;
           
       }
       else if (Channel == 2){
         
-        SpeedMlperMin2 = SpeedMlperMin;
-        VolumeMl2 = VolumeMl;
-        Direction2 = Direction;
-        SpeedToMove = round(SpeedMlperMin * StepsPerMili2 / 60);
-        StepsToMove =   VolumeMl * StepsPerMili2;
+        if (String(Direction2) == "ccw"){
+            VolumeMl2 = - VolumeMl2;
+        }  
+        SpeedToMove2 = round(SpeedMlperMin2 * StepsPerMili2 / 60);
+        StepsToMove2 =   VolumeMl2 * StepsPerMili2;
         Stepper2Running = true;        
-        stepper2.setSpeedInStepsPerSecond(SpeedToMove);
-        stepper2.setTargetPositionRelativeInSteps(StepsToMove);
+        stepper2.setSpeedInStepsPerSecond(SpeedToMove2);
+        stepper2.setTargetPositionRelativeInSteps(StepsToMove2);
         InitialSteps2 = stepper2.getCurrentPositionInSteps() ;
-        TargetSteps2 = InitialSteps2 + StepsToMove;
+        TargetSteps2 = InitialSteps2 + StepsToMove2;
 
       }
       else if (Channel == 3){
 
-        SpeedMlperMin3 = SpeedMlperMin;
-        VolumeMl3 = VolumeMl;
-        Direction3 = Direction;
-        SpeedToMove = round(SpeedMlperMin * StepsPerMili3 / 60);
-        StepsToMove =   VolumeMl * StepsPerMili3;
+        if (String(Direction3) == "ccw"){
+            VolumeMl3 = - VolumeMl3;
+        }  
+        SpeedToMove3 = round(SpeedMlperMin3 * StepsPerMili3 / 60);
+        StepsToMove3 =   VolumeMl3 * StepsPerMili3;
         Stepper3Running = true;        
-        stepper3.setSpeedInStepsPerSecond(SpeedToMove);
-        stepper3.setTargetPositionRelativeInSteps(StepsToMove);
+        stepper3.setSpeedInStepsPerSecond(SpeedToMove3);
+        stepper3.setTargetPositionRelativeInSteps(StepsToMove3);
         InitialSteps3 = stepper3.getCurrentPositionInSteps() ;
-        TargetSteps3 = InitialSteps3 + StepsToMove;
+        TargetSteps3 = InitialSteps3 + StepsToMove3;
 
       }
 
@@ -512,30 +523,33 @@ void CallAction ()
 
      if (Channel == 1){
               
-        StepsPerMili1 = StepsPerMl;
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili1, StepsPerMl);
+        EEPROM.write (EepromStepsPerMili1, StepsPerMili1);
         EEPROM.commit();
+
+        FeedbackData["channel"] = 1;
             
       }
       else if (Channel == 2){
 
-        StepsPerMili2 = StepsPerMl;
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili2, StepsPerMl);
+        EEPROM.write (EepromStepsPerMili2, StepsPerMili2);
         EEPROM.commit();
-            
+
+        FeedbackData["channel"] = 2;
+
       }
       else if (Channel == 3){
         
-        StepsPerMili3 = StepsPerMl;
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili3, StepsPerMl);
+        EEPROM.write (EepromStepsPerMili3, StepsPerMili3);
         EEPROM.commit();
-            
+
+        FeedbackData["channel"] = 3;
+
       }     
          
-        FeedbackData = JSONReceived  ;
+        FeedbackData["action"] = "calibrate";
         FeedbackData["type"] = "done";
           
         DataJSONWeb="";
@@ -579,7 +593,24 @@ void CallAction ()
       }
 
   }
-  
+  else if (String(Action) == "params"){
+
+        FeedbackData["action"] = "params";
+        FeedbackData["type"] = "done";
+        FeedbackData["StepsPerMili1"] = StepsPerMili1;
+        FeedbackData["StepsPerMili2"] = StepsPerMili2;
+        FeedbackData["StepsPerMili3"] = StepsPerMili3;
+          
+        DataJSONWeb="";
+        size_t n = serializeJson(FeedbackData, DataJSONWeb); 
+        char tempJsonString[256]; 
+        DataJSONWeb.toCharArray(tempJsonString, n+1);
+        mqtt_client.publish("peristaltica/status", tempJsonString);
+
+  }
+
+
+
 }
 
 
