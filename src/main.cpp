@@ -6,7 +6,6 @@
 #include <PubSubClient.h> 
 #include <ArduinoJson.h>
 #include <EEPROM.h> 
-#include <AccelStepper.h>
 #include <ESP_FlexyStepper.h>
 
 const char* ssid = "AMARBA_1";
@@ -17,7 +16,7 @@ const char* password = "Travelguide0";
 #define mqtt_server "192.168.1.14"
 #define mqtt_user "Peristaltica"
 #define mqtt_password "mqtt"
-String mqtt_client_id="Peristaltica-";   //This text is concatenated with ChipId to get unique client_id
+String mqtt_client_id="Peristaltica-";  
 
 //MQTT client
 WiFiClient espClient;
@@ -27,7 +26,6 @@ PubSubClient mqtt_client(espClient);
 
 //JSON to store values to send over MQTT
 StaticJsonDocument<256> FeedbackData;
-String DataJSONWeb ="";
 StaticJsonDocument<256> JSONReceived;
 
 
@@ -87,9 +85,9 @@ int EepromStepsPerMili3 = 20;                   //Steps per mililitre in Stepper
 
 
 // Speed settings
-const int SPEED_IN_STEPS_PER_SECOND = 3200;
-const int ACCELERATION_IN_STEPS_PER_SECOND = 3000;
-const int DECELERATION_IN_STEPS_PER_SECOND = 3000;
+const int SPEED_IN_STEPS_PER_SECOND = 2000;
+const int ACCELERATION_IN_STEPS_PER_SECOND = 800;
+const int DECELERATION_IN_STEPS_PER_SECOND = 800;
 
 // create the stepper motor object
 ESP_FlexyStepper stepper1;
@@ -521,13 +519,14 @@ void CallAction ()
   }
   else if (String(Action) == "calibrate"){
 
+     StaticJsonDocument<256> CalibrateFeedbackData;
      if (Channel == 1){
               
         EEPROM.begin(EEPROM_SIZE);
         EEPROM.write (EepromStepsPerMili1, StepsPerMili1);
         EEPROM.commit();
 
-        FeedbackData["channel"] = 1;
+        CalibrateFeedbackData["channel"] = 1;
             
       }
       else if (Channel == 2){
@@ -536,7 +535,7 @@ void CallAction ()
         EEPROM.write (EepromStepsPerMili2, StepsPerMili2);
         EEPROM.commit();
 
-        FeedbackData["channel"] = 2;
+        CalibrateFeedbackData["channel"] = 2;
 
       }
       else if (Channel == 3){
@@ -545,18 +544,18 @@ void CallAction ()
         EEPROM.write (EepromStepsPerMili3, StepsPerMili3);
         EEPROM.commit();
 
-        FeedbackData["channel"] = 3;
+        CalibrateFeedbackData["channel"] = 3;
 
       }     
          
-        FeedbackData["action"] = "calibrate";
-        FeedbackData["type"] = "done";
+        CalibrateFeedbackData["action"] = "calibrate";
+        CalibrateFeedbackData["type"] = "done";
           
-        DataJSONWeb="";
-        size_t n = serializeJson(FeedbackData, DataJSONWeb); 
-        char tempJsonString[256]; 
-        DataJSONWeb.toCharArray(tempJsonString, n+1);
-        mqtt_client.publish("peristaltica/status", tempJsonString);
+     
+        char tempJsonStringC[256];
+        size_t nc = serializeJson(CalibrateFeedbackData, tempJsonStringC);    
+        mqtt_client.publish("peristaltica/status", tempJsonStringC, nc);
+
       
   
   }
@@ -595,21 +594,19 @@ void CallAction ()
   }
   else if (String(Action) == "params"){
 
-        FeedbackData["action"] = "params";
-        FeedbackData["type"] = "done";
-        FeedbackData["StepsPerMili1"] = StepsPerMili1;
-        FeedbackData["StepsPerMili2"] = StepsPerMili2;
-        FeedbackData["StepsPerMili3"] = StepsPerMili3;
-          
-        DataJSONWeb="";
-        size_t n = serializeJson(FeedbackData, DataJSONWeb); 
-        char tempJsonString[256]; 
-        DataJSONWeb.toCharArray(tempJsonString, n+1);
-        mqtt_client.publish("peristaltica/status", tempJsonString);
+        StaticJsonDocument<256> ResponseFeedbackData;
+        ResponseFeedbackData["action"] = "params";
+        ResponseFeedbackData["type"] = "done";
+        ResponseFeedbackData["StepsPerMili1"] = StepsPerMili1;
+        ResponseFeedbackData["StepsPerMili2"] = StepsPerMili2;
+        ResponseFeedbackData["StepsPerMili3"] = StepsPerMili3;   
+
+        char tempJsonStringR[256];
+        size_t nr = serializeJson(ResponseFeedbackData, tempJsonStringR);    
+        mqtt_client.publish("peristaltica/status", tempJsonStringR, nr);
+
 
   }
-
-
 
 }
 
@@ -686,9 +683,9 @@ void StepperSetup()
   stepper3.registerTargetPositionReachedCallback(targetPositionReachedCallback);
   stepper3.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
 
-  stepper1.startAsService();
-  stepper2.startAsService();
-  stepper3.startAsService();
+  stepper1.startAsService(0);
+  stepper2.startAsService(0);
+  stepper3.startAsService(0);
 }
 
 
