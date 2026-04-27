@@ -91,23 +91,32 @@ ESP_FlexyStepper::~ESP_FlexyStepper()
 }
 
 //TODO: use https://github.com/nrwiersma/ESP8266Scheduler/blob/master/examples/simple/simple.ino for ESP8266
-void ESP_FlexyStepper::startAsService(int core)
+bool ESP_FlexyStepper::startAsService(int coreNumber)
 {
-
- if ( (!core_0_wdt_was_disabled_from_flexyStepper) && (core!=1) ) //If WDT has not been disabled previously and core 1 is not selected
+  if (coreNumber == 1)
   {
-disableCore0WDT(); // we have to disable the Watchdog timer to prevent it from rebooting the ESP all the time another option would be to add a vTaskDelay but it would slow down the stepper
-core_0_wdt_was_disabled_from_flexyStepper=1; //Let's indicate that we have disabled WDT for kernel 0
+    disableCore1WDT(); // we have to disable the Watchdog timer to prevent it from rebooting the ESP all the time another option would be to add a vTaskDelay but it would slow down the stepper
   }
-  
-  xTaskCreateUniversal(             //This type of task is specially adapted to work with single and dual core versions of ESP32
+  else if (coreNumber == 0)
+  {
+    disableCore0WDT(); // we have to disable the Watchdog timer to prevent it from rebooting the ESP all the time another option would be to add a vTaskDelay but it would slow down the stepper
+  }
+  else
+  {
+    //invalid core number given
+    return false;
+  }
+
+  xTaskCreatePinnedToCore(
       ESP_FlexyStepper::taskRunner, /* Task function. */
       "FlexyStepper",               /* String with name of task (by default max 16 characters long) */
       2000,                         /* Stack size in bytes. */
       this,                         /* Parameter passed as input of the task */
       1,                            /* Priority of the task, 1 seems to work just fine for us */
       &this->xHandle,               /* Task handle. */
-      core);                        /* The core on which our task will be executed*/
+      coreNumber                    /* the cpu core to use, 1 is where usually the Arduino Framework code (setup and loop function) are running, core 0 by default runs the Wifi Stack */
+  );
+  return true;
 }
 
 void ESP_FlexyStepper::taskRunner(void *parameter)
@@ -197,7 +206,7 @@ void ESP_FlexyStepper::setDirectionToHome(signed char directionTowardHome)
 
 /**
  * Notification of an externaly detected limit switch activation
- * Accepts LIMIT_SWITCH_BEGIN (-1) or LIMIT_SWITCH_END as parameter values to indicate 
+ * Accepts LIMIT_SWITCH_BEGIN (-1) or LIMIT_SWITCH_END (1) as parameter values to indicate 
  * whether the limit switch near the begin (direction of home position) or at the end of the movement has ben triggered.
  * It is strongly recommended to perform debouncing before calling this function to prevent issues when button is released and retriggering the limit switch function
  */
@@ -209,7 +218,7 @@ void ESP_FlexyStepper::setLimitSwitchActive(byte limitSwitchType)
     this->limitSwitchCheckPeformed = false; //set flag for newly set limit switch trigger
     if (this->_limitTriggeredCallback)
     {
-      this->_limitTriggeredCallback();
+      this->_limitTriggeredCallback(); //TODO: this function is called from within a ISR in ESPStepperMotorServer thus we should try to delay calling of the callback to the backound task / process Steps function
     }
   }
 }
@@ -256,7 +265,10 @@ void ESP_FlexyStepper::connectToPins(byte stepPinNumber, byte directionPinNumber
   pinMode(stepPin, OUTPUT);
   digitalWrite(stepPin, LOW);
 
-  pinMode(directionPin, OUTPUT);
+  if (directionPin < 255)
+  {
+    pinMode(directionPin, OUTPUT);
+  }
   digitalWrite(directionPin, LOW);
 }
 
@@ -303,7 +315,7 @@ void ESP_FlexyStepper::setBrakeEngageDelayMs(unsigned long delay)
 }
 
 /**
- * set a timeout in milliseconds fter which the brake shall be released once triggered and no motion is performed by the stpper motor.
+ * set a timeout in milliseconds after which the brake shall be released once triggered and no motion is performed by the stpper motor.
  * By default the value is -1 indicating, that the brake shall never be automatically released, as long as the stepper motor is not moving to a new position.
  * Value must be larger than 1 (Even though 1ms delay does probably not make any sense since physical brakes have a delay that is most likely higher than that just to engange)
  */
@@ -343,6 +355,8 @@ void ESP_FlexyStepper::deactivateBrake()
     this->_isBrakeActive = false;
     this->_timeToReleaseBrake = LONG_MAX;
     this->_hasMovementOccuredSinceLastBrakeRelease = false;
+
+    //TODO: add delay here if configured as to https://github.com/pkerspe/ESP-StepperMotor-Server/issues/16
   }
 }
 
@@ -374,8 +388,9 @@ float ESP_FlexyStepper::getCurrentPositionInMillimeters()
 }
 
 //
-// set the current position of the motor in millimeters, this does not move the
-// motor
+// set the current position of the motor in millimeters.
+// Do not confuse this function with setTargetPositionInMillimeters(), it does not directly cause a motor movement per se.
+// NOTE: if you called one of the move functions before (and by that setting a target position internally) you might experience that the motor starts to move after calling setCurrentPositionInMillimeters() in the case that the value of currentPositionInMillimeters is different from the target position of the stepper. If this is not intended, you should call setTargetPositionInMillimeters() with the same value as the setCurrentPositionInMillimeters() function directly before or after calling setCurrentPositionInMillimeters
 //
 void ESP_FlexyStepper::setCurrentPositionInMillimeters(
     float currentPositionInMillimeters)
@@ -497,6 +512,11 @@ void ESP_FlexyStepper::setTargetPositionInMillimeters(
                                        stepsPerMillimeter));
 }
 
+float ESP_FlexyStepper::getTargetPositionInMillimeters()
+{
+  return getTargetPositionInSteps() / stepsPerMillimeter;
+}
+
 //
 // Get the current velocity of the motor in millimeters/second.  This functions is
 // updated while it accelerates up and down in speed.  This is not the desired
@@ -536,8 +556,9 @@ float ESP_FlexyStepper::getCurrentPositionInRevolutions()
 
 //
 // set the current position of the motor in revolutions, this does not move the
-// motor
-//
+// Do not confuse this function with setTargetPositionInRevolutions(), it does not directly cause a motor movement per se.
+// NOTE: if you called one of the move functions before (and by that setting a target position internally) you might experience that the motor starts to move after calling setCurrentPositionInRevolutions() in the case that the value of currentPositionInRevolutions is different from the target position of the stepper. If this is not intended, you should call setTargetPositionInRevolutions() with the same value as the setCurrentPositionInRevolutions() function directly before or after calling setCurrentPositionInRevolutions
+
 void ESP_FlexyStepper::setCurrentPositionInRevolutions(
     float currentPositionInRevolutions)
 {
@@ -658,6 +679,11 @@ void ESP_FlexyStepper::setTargetPositionInRevolutions(
                                        stepsPerRevolution));
 }
 
+float ESP_FlexyStepper::getTargetPositionInRevolutions()
+{
+  return getTargetPositionInSteps() / stepsPerRevolution;
+}
+
 //
 // Get the current velocity of the motor in revolutions/second.  This functions is
 // updated while it accelerates up and down in speed.  This is not the desired
@@ -679,8 +705,12 @@ float ESP_FlexyStepper::getCurrentVelocityInRevolutionsPerSecond()
 
 //
 // set the current position of the motor in steps, this does not move the motor
-// Note: This function should only be called when the motor is stopped
-//    Enter:  currentPositionInSteps = the new position of the motor in steps
+// currentPositionInSteps = the new position value of the motor in steps to be set internally for the current position
+// Do not confuse this function with setTargetPositionInMillimeters(), it does not directly cause a motor movement per se.
+// Notes:
+// This function should only be called when the motor is stopped
+// If you called one of the move functions before (and by that setting a target position internally) you might experience that the motor starts to move after calling setCurrentPositionInSteps() in the case that the value of currentPositionInSteps is different from the target position of the stepper. If this is not intended, you should call setTargetPositionInSteps() with the same value as the setCurrentPositionInSteps() function directly before or after calling setCurrentPositionInSteps
+
 //
 void ESP_FlexyStepper::setCurrentPositionInSteps(long currentPositionInSteps)
 {
@@ -755,15 +785,16 @@ void ESP_FlexyStepper::setCurrentPositionAsHomeAndStop()
  * Warning: This function requires a limit switch to be configured otherwise the motor will never stop jogging.
  * This is a non blocking function, you need make sure ESP_FlexyStepper is started as service (use startAsService() function) or need to call the processMovement function manually in your main loop.
  */
-void ESP_FlexyStepper::goToLimitAndSetAsHome(callbackFunction callbackFunctionForHome)
+void ESP_FlexyStepper::goToLimitAndSetAsHome(callbackFunction callbackFunctionForHome, long maxDistanceToMoveInSteps)
 {
   if (callbackFunctionForHome)
   {
     this->_homeReachedCallback = callbackFunctionForHome;
   }
+  //the second check basically utilizes the fact the the begin and end limit switch id is 1 respectively -1 so the values are the same as the direction of the movement when the steppers moves towards of of the limits
   if (this->activeLimitSwitch == 0 || this->activeLimitSwitch != this->directionTowardsHome)
   {
-    this->setTargetPositionInSteps(this->directionTowardsHome * 2000000000);
+    this->setTargetPositionInSteps(this->getCurrentPositionInSteps() + (this->directionTowardsHome * maxDistanceToMoveInSteps));
   }
   this->isOnWayToHome = true; //set as last action, since other functions might overwrite it
 }
@@ -777,7 +808,7 @@ void ESP_FlexyStepper::goToLimit(signed char direction, callbackFunction callbac
 
   if (this->activeLimitSwitch == 0)
   {
-    this->setTargetPositionInSteps(direction * 2000000000);
+    this->setTargetPositionInSteps(this->getCurrentPositionInSteps() + (this->directionTowardsHome * 2000000000));
   }
   this->isOnWayToLimit = true; //set as last action, since other functions might overwrite it
 }
@@ -1020,6 +1051,11 @@ void ESP_FlexyStepper::setTargetPositionInSteps(long absolutePositionToMoveToInS
   this->firstProcessingAfterTargetReached = true;
 }
 
+long ESP_FlexyStepper::getTargetPositionInSteps()
+{
+  return targetPosition_InSteps;
+}
+
 //
 // setup a "Stop" to begin the process of decelerating from the current velocity
 // to zero, decelerating requires calls to processMove() until the move is complete
@@ -1032,7 +1068,8 @@ void ESP_FlexyStepper::setTargetPositionToStop()
   this->isOnWayToHome = false;
   this->isOnWayToLimit = false;
 
-  if(directionOfMotion == 0){
+  if (directionOfMotion == 0)
+  {
     return;
   }
 

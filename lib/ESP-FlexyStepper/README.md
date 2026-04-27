@@ -7,7 +7,7 @@ This library is used to control one or more stepper motors with a ESP 32 module.
 ## Features
 
 The library provides the following features:
-  - generating pulses for a connected stepper driver with a dir and step input
+  - generating pulses for a connected stepper driver with a direction and step input
   - connection of emergency switch to stop all motion immendiately
   - connection of limit switches / homing switches
   - blocking and non blocking function calls possible
@@ -17,7 +17,35 @@ The library provides the following features:
     - manually call the processMovement() function in the main loop (then you have to make sure your main loop completes quick enough to ensure smooth movement
     - use the blocking movement functions, that take care of calling processMovement but block the main loop for the duration of the movement
 
-## Example
+## A view words on jitter in the generated step signals
+
+Depdending on your custom code and user case where you are using the ESP FlexyStepper library as a part, you might experience some jitter (unstable/uneven step signal frequency, short breaks in the movement or in general a not always smoothly running stepper motor).
+The reason for this is to be found in the basic principle how the library is implemented currently and the fact that the Arduino sketch is running as a task within the FreeRTOS operating system of the ESP32 and along with some other hose keeping tasks in "parallel".
+When you start the library as a service using the "startAsService(int coreNumber)" function, it will start a separate task on one of the two cores of the ESP32. It most cases it will not be the only task running on this core (no matter which one you chose) so it will need to share the available CPU time with at least one other task running on the same core.
+Usually the "setup" and "loop" function of an Arduino Framework based programm will run on core 1 of the ESP.
+To my knowledge core 0 usually runs the Wifi/Bluetooth/BLE stack task.
+
+What does this mean for you and how is it related to jitter you might ask?
+Since multiple tasks that are running on the same core, also need to share the CPU cycles (for more on this topic of how tasks are managed in FreeRTOS, and the mysterious role of a 'Tick' this might be a good starting point: https://www.freertos.org/implementation/a00011.html) you can get into trouble and see some jitter expescially with higher step signal frequencies (higher stepper speeds). The result will be a noisy, bumpy stepper movement since the ESP Flexy Stepper Task is interrupted by the Operating System every now and then and thus might not be able to send the step signal in time to the IO Pin. 
+
+What can I do now?
+When starting the service using the startAsService() function you can provide a parameter to define the core number on which to pin the task to. The default value is 1.
+
+If you have lot of code in the loop() function of you programm, you can start the stepper service on Core 0 of the ESP32, this way it will not interfere with some heavy load you might be generating in the loop function BUT if you are also using the WiFi/Bluetooth/BLE stack of the ESP32, then core 0 might not be a good idea either, since the task that manages the before managed stack is usually running on core 0 of the ESP32 and with a high priority. So if you move the motor and at the same time have a lot of Wifi traffic or BT/BLE communication going on, the OS will frequently stop the execution of the ESP Flexy Stepper task to yield the way for the Wireless stack. You will see more jitter the more wireless communication is going on.
+If you rely on wireless communication in your project and at the same time you have some a lot of going on in the loop function (e.g. long running loops and other function calls), you might need to change your software architecture in general.
+The goal is to keep the time neeed to execute the code in the loop function as short as possible as long as the ESP Flexyy Stepper library is running as a service on Core 1. You can move in the direction of a interrupt or event based design pattern rather than having long running loops or while statements that just wait for a response or change of a pin state for example.
+
+Decision matrix:
+| Scenario | Suggestion which core to use |
+| --- | --- |
+| You are using Wifi / Bluetooth or BLE in your project | if you send/receive data while the motor is moving: start the service on core 1<br/>if you only send / receive data while the motor is not moving: you might get away with starting the service on core 0, if you experience jitter, start it on core 1 |
+| You are NOT using Wifi / Bluetooth or BLE in your project | start the service on core 0 |
+| You have a lot of code in your loop() function that takes a lot of time for each loop execution | if you are not using wireless communication: start the service on core 0<br/>if you are using wireless communication, go to line one of this decision matrix, if this does not help you will most likely need to optimize your loop() function execution time or move to a event/interrupt based design. You can also try to increase the task priorty of the ESP Flexy Stepper task in ESP_FlexyStepper.cpp in the xTaskCreatePinnedToCore(...) function call |
+
+For more details on the topic you can also have a look at the discussion in issue #4: https://github.com/pkerspe/ESP-FlexyStepper/issues/4 
+
+
+## Example Code
 
 The following is an example of how to use the library as a service running in the "background" as a separate Task on the ESP32:
 
@@ -52,7 +80,7 @@ void setup()
   
   // Not start the stepper instance as a service in the "background" as a separate task
   // and the OS of the ESP will take care of invoking the processMovement() task regularily so you can do whatever you want in the loop function
-  stepper.startAsService();
+  stepper.startAsService(1);
 }
 
 void loop()
@@ -68,7 +96,7 @@ void loop()
   }
   
   // Notice that you can now do whatever you want in the loop function without the need to call processMovement().
-  // also you do not have to care if your loop processing times are too long. 
+  // also you do not have to care if your loop processing times are too long (you might experience some jitter though if you do). 
 }
 ```
 
@@ -77,7 +105,7 @@ void loop()
 | Function | Desciption |
 | --- | --- |
 | `ESP_FlexyStepper()` | constructor for the class to create a new instance of the ESP-FlexyStepper |
-| `void startAsService()` | start ESP-FlexyStepper as a seprate task (service) in the background so it handles the calls to processMovement() for you in thebackground and you are free to do whatever you want in the main loop. *Should NOT be used in combination with the synchronous (blocking) function calls for movement* |
+| `void startAsService(int coreNumber)` | start ESP-FlexyStepper as a seprate task (service) in the background on the defined CPU core defined by coreNumber parameter (valid values are 0 and 1), so it handles the calls to processMovement() for you in thebackground and you are free to do whatever you want (See note on jitter also if you plan to perform CPU intensive Tasks in the loop function) in the main loop. *Should NOT be used in combination with the synchronous (blocking) function calls for movement* |
 | `void stopService()` | stop the ESP-FlexyStepper service. Only needed if startAsService() has been called before |
 | `void connectToPins(byte stepPinNumber, byte directionPinNumber)` | setup the pin numbers where the external stepper driver is connected to. Provide the IO Pins fro step (or pulse) pin and direction pin |
 | `bool isStartedAsService()` | returns true if the ESP-FlexyStepper service has been started/is running, false if not |
@@ -87,7 +115,7 @@ void loop()
 | `void setAccelerationInMillimetersPerSecondPerSecond(float accelerationInMillimetersPerSecondPerSecond)` | |
 | `void setDecelerationInMillimetersPerSecondPerSecond(float decelerationInMillimetersPerSecondPerSecond)` | |
 | `float getCurrentPositionInMillimeters()` | get the current, absolute position in milimeters. Requires that the library has been configrued properly by using the `setStepsPerMillimeter(...)` function |
-| `void setCurrentPositionInMillimeters(float currentPositionInMillimeters)` | set the register for the current position to a specific value e.g. to mark the home position |
+| `void setCurrentPositionInMillimeters(float currentPositionInMillimeters)` | set the register for the current position to a specific value e.g. to mark the home position. See also the NOTE in setCurrentPositionInSteps() |
 | `void setSpeedInMillimetersPerSecond(float speedInMillimetersPerSecond)` | set the speed for the next movements (or the current motion if any is in progress) in mm/s. Requires prior configuration of the library using `setStepsPerMillimeter()` |
 | `bool moveToHomeInMillimeters(signed char directionTowardHome, float speedInMillimetersPerSecond, long maxDistanceToMoveInMillimeters, int homeLimitSwitchPin)` | |
 | `void setSpeedInRevolutionsPerSecond(float speedInRevolutionsPerSecond)` | set the speed for the next movements (or the current motion if any is in progress) in revs/s. Requires prior configuration of the library using `setStepsPerRevolution()`|
@@ -101,7 +129,7 @@ void loop()
 | `void moveToPositionInMillimeters(float absolutePositionToMoveToInMillimeters)` | *Blocking call:* start movement to absolute position in mm. This is a blocking function, it will not return before the final position has been reached. |
 | `void setTargetPositionInMillimeters(float absolutePositionToMoveToInMillimeters)` | set the target position to an absolute value in mm. Requires the repeated call of processMovement() to sequentially update the stepper position or you need to start the ESP-FlexyStepper as as service using `startAsService()` and let the library to the rest for you. |
 | `long getDistanceToTargetSigned(void)` | get the distance in steps to travel from the current position to the target position. If stepper has reached it's target position then 0 will be returned. This is a signed value, depending on the direction of the current movement |
-| `void setCurrentPositionInRevolutions(float currentPositionInRevolutions)` | set the current position inr revolutions (basically assign a value to the current position) |
+| `void setCurrentPositionInRevolutions(float currentPositionInRevolutions)` | set the current position inr revolutions (basically assign a value to the current position). See also the NOTE in setCurrentPositionInSteps() |
 | `float getCurrentPositionInRevolutions()` | get the current, absolute position in revs |
 | `bool moveToHomeInRevolutions(signed char directionTowardHome, float speedInRevolutionsPerSecond, long maxDistanceToMoveInRevolutions, int homeLimitSwitchPin)` | *Blocking call:* move to home position (max steps or until limit switch goes low. This is a blocking function, it will not return before the final position has been reached. |
 | `void moveRelativeInRevolutions(float distanceToMoveInRevolutions)` | *Blocking call:* start relative movement with given number of revolutions. This is a blocking function, it will not return before the final position has been reached. |
@@ -111,7 +139,7 @@ void loop()
 | `float getCurrentVelocityInRevolutionsPerSecond()` | return the current velocity as floating point number in Revolutions/Second *Note: make sure you configured the stepper correctly using the `setStepsPerRevolution` function before calling this function, otherwise the result might be incorrect!*|
 | `float getCurrentVelocityInStepsPerSecond()` | return the current velocity as floating point number in Steps/Second |
 | `float getCurrentVelocityInMillimetersPerSecond(void)` | return the current velocity as floating point number in milimeters/Second. *Note: make sure you configured the stepper correctly using the `setStepsPerMillimeter` function before calling this function, otherwise the result might be incorrect!* |
-| `void setCurrentPositionInSteps(long currentPositionInSteps)` |  |
+| `void setCurrentPositionInSteps(long currentPositionInSteps)` | set the register for the current position to a specific value e.g. to mark the home position. NOTE: if you called one of the move functions before (and by that setting a target position internally) you might experience that the motor starts to move after calling setCurrentPositionInSteps(currentPositionInSteps) in the case that the value of currentPositionInSteps is different from the target position of the stepper. If this is not intended, you should call setTargetPositionInSteps() with the same value as the setCurrentPositionInSteps() function directly before or after calling setCurrentPositionInSteps |
 | `void setCurrentPositionAsHomeAndStop(void)` | set the current position of the stepper as the home position. This also sets the current position to 0. After peforming this step you can always return to the home position by calling `setTargetPoisitionInSteps(0)`(or for blocking calls `moveToPositionInSteps(0)`) |
 | `long getCurrentPositionInSteps()` | return the current position of the stepper in steps (absolute value, could also be negative if no proper homing has been performed before) |
 | `bool moveToHomeInSteps(signed char directionTowardHome, float speedInStepsPerSecond, long maxDistanceToMoveInSteps, int homeSwitchPin)` | *Blocking call:* start movement in the given direction with a maximum number of steps or until the IO Pin defined by homeSwitchPin is going low (active low switch is required, since the library will configure this pin as input with internal pullup in the current version). This is a blocking function, it will not return before the final position has been reached.|

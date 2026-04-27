@@ -3,24 +3,29 @@
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-#include <PubSubClient.h> 
 #include <ArduinoJson.h>
 #include <EEPROM.h> 
 #include <ESP_FlexyStepper.h>
+extern "C" {
+	#include "freertos/FreeRTOS.h"
+	#include "freertos/timers.h"
+}
+#include <AsyncMqttClient.h>
 
-const char* ssid = "AMARBA_1";
-const char* password = "Travelguide0";
+const char* ssid = "MMV_1";
+const char* password = "2Pomad@s";
 
 
 //MQTT configuration
-#define mqtt_server "192.168.1.14"
-#define mqtt_user "Peristaltica"
+#define MQTT_HOST IPAddress(192, 168, 1, 100)
+#define MQTT_PORT 1883
+#define mqtt_user "hass"
 #define mqtt_password "mqtt"
-String mqtt_client_id="Peristaltica-";  
 
-//MQTT client
-WiFiClient espClient;
-PubSubClient mqtt_client(espClient);
+AsyncMqttClient mqttClient;
+TimerHandle_t mqttReconnectTimer;
+TimerHandle_t wifiReconnectTimer;
+
 
 
 
@@ -71,6 +76,7 @@ long TargetSteps1;
 long TargetSteps2;
 long TargetSteps3;
 int StepperStopped;
+byte ChannelStopped;
 bool Stepper1Running = false;
 bool Stepper2Running = false;
 bool Stepper3Running = false;
@@ -96,43 +102,17 @@ ESP_FlexyStepper stepper3;
 
 // delays
 long ProgressPreviousMillis = 0;                  //variables for delayed broacasting of Progress
-long ProgressTime = 1000;                         //     "
+long ProgressTime = 5000;                         //     "
 long ProgressCurrentMillis;                       //     "
 
-
+//Core 0
+TaskHandle_t C0;
 
 // ------------- FUNCTIONS ----------------
 
 
 
-void mqtt_reconnect() {
-  // Loop until we're reconnected
-  while (!mqtt_client.connected()) {
-    //Serial.print("Attempting MQTT connection...");
-
-    if (mqtt_client.connect(mqtt_client_id.c_str(), mqtt_user, mqtt_password)) {
-      //Serial.println("connected");
-      mqtt_client.subscribe("peristaltica/action");
-
-    } else {
-      //Serial.print("failed, rc=");
-      //Serial.print(mqtt_client.state());
-      //Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
-}
-
-
-void connectToMqtt() {
-  Serial.println("Connecting to MQTT...");
-  mqtt_reconnect();
-}
-
-
-
-void WifiSetup ()
+void connectToWifi ()
 {
   Serial.println("Booting");
 
@@ -153,23 +133,27 @@ void WifiSetup ()
 
 }
 
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+
 void WiFiEvent(WiFiEvent_t event) {
-  Serial.printf("[WiFi-event] event: %d\n", event);
-  switch(event) {
+    Serial.printf("[WiFi-event] event: %d\n", event);
+    switch(event) {
     case SYSTEM_EVENT_STA_GOT_IP:
-      Serial.println("");
-      Serial.print("Connected to ");
-      Serial.println(ssid);
-      Serial.print("IP address: ");
-      Serial.println(WiFi.localIP());
-      mqtt_reconnect();
-      break;
+        Serial.println("WiFi connected");
+        Serial.println("IP address: ");
+        Serial.println(WiFi.localIP());
+        connectToMqtt();
+        break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-      Serial.println("WiFi lost connection");
-      WifiSetup ();
-      mqtt_reconnect();
-      break;
-  }
+        Serial.println("WiFi lost connection");
+        xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+        xTimerStart(wifiReconnectTimer, 0);
+        break;
+    }
 }
 
 
@@ -232,41 +216,14 @@ void OTASetup()
 
 
 
-void targetPositionReachedCallback(long position)
+void targetPositionReachedCallback()
 {     
     
-    byte ChannelStopped;
-    //Identify which stepper has stopped
-    if (stepper1.motionComplete() && Stepper1Running == true)
-      {
-        Stepper1Running = false;
-        ChannelStopped = 1;
-
-      }
-    if (stepper2.motionComplete() && Stepper2Running == true)
-      {
-        Stepper2Running = false;
-        ChannelStopped = 2;
-
-      }
-    if (stepper3.motionComplete() && Stepper3Running == true)
-      {
-        Stepper3Running = false;
-        ChannelStopped = 3;
-
-      }
 
     //disable steppers if all are not moving
-    if (stepper1.motionComplete())
+    if (Stepper1Running == false && Stepper2Running == false && Stepper3Running == false)
     {
-      if (stepper2.motionComplete())
-      {
-        if (stepper3.motionComplete())
-        {
-          digitalWrite(EnableStepper, HIGH);  
-
-        }
-      }
+      digitalWrite(EnableStepper, HIGH);  
     }	
   
     
@@ -278,47 +235,66 @@ void targetPositionReachedCallback(long position)
     ResponseDone["progress"] = 100;  
 
     size_t n = serializeJson(ResponseDone, tempJsonStringDone);    
-    mqtt_client.publish("peristaltica/status", tempJsonStringDone, n);
+    uint16_t packetIdPubDN = mqttClient.publish("peristaltica/status", 1, true, tempJsonStringDone);
+
+  //  Serial.print("targetPositionReachedCallback: ");
+  //  Serial.println(tempJsonStringDone);  
 
 }
 
+void targetPositionReachedCallbackStepper1(long position)
+{
+  Stepper1Running = false;
+  ChannelStopped = 1;
+  targetPositionReachedCallback();
+
+}
+void targetPositionReachedCallbackStepper2(long position)
+{
+  Stepper2Running = false;
+  ChannelStopped = 2;  
+  targetPositionReachedCallback();
+ 
+}
+void targetPositionReachedCallbackStepper3(long position)
+{
+  Stepper3Running = false;
+  ChannelStopped = 3;
+  targetPositionReachedCallback();
+}
 
 
 void emergencyStopTriggerdCallbackFunction ()
 {     
-
-    if (Stepper1Running == false)
-    {
-      if (Stepper2Running == false)
-      {
-        if (Stepper3Running == false)
-        {
-          digitalWrite(EnableStepper, HIGH);  //disable steppers if all are not moving
-
-        }
-      }
-    }	
+  //disable steppers if all are not moving
+  if (Stepper1Running == false && Stepper2Running == false && Stepper3Running == false)
+  {
+    digitalWrite(EnableStepper, HIGH);  
+  }	
 
   int progressStop;
 
   if (StepperStopped == 1){
       long CurrentSteps1;
       CurrentSteps1 = stepper1.getCurrentPositionInSteps() ;
-      progressStop = round(100 * (CurrentSteps1 - InitialSteps1)/(TargetSteps1 - InitialSteps1));
-
+      if (Stepper1Running == true){
+        progressStop = round(100 * (CurrentSteps1 - InitialSteps1)/(TargetSteps1 - InitialSteps1));
+      }
         
   }
   else if (StepperStopped == 2){
       long CurrentSteps2;
       CurrentSteps2 = stepper2.getCurrentPositionInSteps() ;
-      progressStop = round(100 * (CurrentSteps2 - InitialSteps2)/(TargetSteps2 - InitialSteps2));
-
+      if (Stepper2Running == true){
+        progressStop = round(100 * (CurrentSteps2 - InitialSteps2)/(TargetSteps2 - InitialSteps2));
+      }
   }
   else if (StepperStopped == 3){    
       long CurrentSteps3;
       CurrentSteps3 = stepper3.getCurrentPositionInSteps() ;
-      progressStop = round(100 * (CurrentSteps3 - InitialSteps3)/(TargetSteps3 - InitialSteps3));
-
+      if (Stepper3Running == true){
+        progressStop = round(100 * (CurrentSteps3 - InitialSteps3)/(TargetSteps3 - InitialSteps3));
+      }
   }
 
 
@@ -330,7 +306,10 @@ void emergencyStopTriggerdCallbackFunction ()
     ResponseDone["progress"] = progressStop;  
 
     size_t n = serializeJson(ResponseDone, tempJsonStringDone);    
-    mqtt_client.publish("peristaltica/status", tempJsonStringDone, n);
+    uint16_t packetIdPubD = mqttClient.publish("peristaltica/status", 1, true, tempJsonStringDone);
+
+  //  Serial.print("emergencyStopTriggerdCallbackFunction: ");
+  //  Serial.println(tempJsonStringDone); 
 
 }
 
@@ -343,7 +322,7 @@ void checkProgress()
   if (ProgressCurrentMillis - ProgressPreviousMillis > ProgressTime)
   {
     ProgressPreviousMillis = ProgressCurrentMillis; 
-
+    //Serial.println("Progress...");
   
     if (Stepper1Running == true)
     {
@@ -352,7 +331,7 @@ void checkProgress()
       int Progress1;
       CurrentSteps1 = stepper1.getCurrentPositionInSteps() ;
       Progress1 = round(100 * (CurrentSteps1 - InitialSteps1)/(TargetSteps1 - InitialSteps1));
-      
+          
       StaticJsonDocument<256> Response1;
       Response1["type"] = "running";
       Response1["action"] = "run";
@@ -360,8 +339,10 @@ void checkProgress()
       Response1["progress"] = Progress1;
       char tempJsonString1[256];
       size_t n1 = serializeJson(Response1, tempJsonString1);    
-      mqtt_client.publish("peristaltica/status", tempJsonString1, n1);
+      uint16_t packetIdPub1 = mqttClient.publish("peristaltica/status", 1, true, tempJsonString1);
 
+    //Serial.print("Progress Stepper 1... ");
+    //Serial.println(tempJsonString1);
     }
 
     if (Stepper2Running == true)
@@ -378,8 +359,10 @@ void checkProgress()
       Response2["progress"] = Progress2;
       char tempJsonString2[256];
       size_t n2 = serializeJson(Response2, tempJsonString2);    
-      mqtt_client.publish("peristaltica/status", tempJsonString2, n2);
+      uint16_t packetIdPub2 = mqttClient.publish("peristaltica/status", 1, true, tempJsonString2);
 
+    //Serial.print("Progress Stepper 2... ");
+    //Serial.println(tempJsonString2);
     }
 
     if (Stepper3Running == true)
@@ -396,12 +379,20 @@ void checkProgress()
       Response3["progress"] = Progress3;
       char tempJsonString3[256];
       size_t n3 = serializeJson(Response3, tempJsonString3);    
-      mqtt_client.publish("peristaltica/status", tempJsonString3, n3);
+      uint16_t packetIdPub3 = mqttClient.publish("peristaltica/status", 1, true, tempJsonString3);
 
+    //Serial.print("Progress Stepper 3... ");
+    //Serial.println(tempJsonString3);
     }
 
   }
 
+    //disable steppers if all are not moving
+    if (Stepper1Running == false && Stepper2Running == false && Stepper3Running == false)
+    {
+      digitalWrite(EnableStepper, HIGH);  
+    }	
+ 
 
 }
 
@@ -469,10 +460,10 @@ void CallAction ()
 {
   if (String(Action) == "run"){ 
     
-      digitalWrite(EnableStepper, LOW);
      
      if (Channel == 1){
   
+        digitalWrite(EnableStepper, LOW);
         if (String(Direction1) == "ccw"){
             VolumeMl1 = - VolumeMl1;
         }  
@@ -487,6 +478,7 @@ void CallAction ()
       }
       else if (Channel == 2){
         
+        digitalWrite(EnableStepper, LOW);
         if (String(Direction2) == "ccw"){
             VolumeMl2 = - VolumeMl2;
         }  
@@ -501,6 +493,7 @@ void CallAction ()
       }
       else if (Channel == 3){
 
+        digitalWrite(EnableStepper, LOW);
         if (String(Direction3) == "ccw"){
             VolumeMl3 = - VolumeMl3;
         }  
@@ -554,9 +547,10 @@ void CallAction ()
      
         char tempJsonStringC[256];
         size_t nc = serializeJson(CalibrateFeedbackData, tempJsonStringC);    
-        mqtt_client.publish("peristaltica/status", tempJsonStringC, nc);
+        uint16_t packetIdPubC = mqttClient.publish("peristaltica/status", 1, true, tempJsonStringC);
 
-      
+//    Serial.print("Calibrate: ");
+//    Serial.println(tempJsonStringC);    
   
   }
   else if (String(Action) == "stop"){
@@ -569,6 +563,8 @@ void CallAction ()
         stepper1.emergencyStop();
         stepper2.emergencyStop();
         stepper3.emergencyStop();
+
+        digitalWrite(EnableStepper, HIGH);
       
       }
       else if (Channel == 1){
@@ -603,16 +599,15 @@ void CallAction ()
 
         char tempJsonStringR[256];
         size_t nr = serializeJson(ResponseFeedbackData, tempJsonStringR);    
-        mqtt_client.publish("peristaltica/status", tempJsonStringR, nr);
-
-
+        uint16_t packetIdPubR = mqttClient.publish("peristaltica/status", 1, true, tempJsonStringR);
+  
   }
 
 }
 
 
 
-void callback(char* topic, byte* payload, unsigned int length) {
+void callback(char* topic, char* payload, unsigned int length) {
  
    JSONReceived="";
    DeserializationError errorDes = deserializeJson(JSONReceived, payload, length);
@@ -629,14 +624,89 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to MQTT.");
+  Serial.print("Session present: ");
+  Serial.println(sessionPresent);
+  uint16_t packetIdSub = mqttClient.subscribe("peristaltica/action", 1);
+  Serial.print("Subscribing at QoS 1, packetId: ");
+  Serial.println(packetIdSub);
+  
+  uint16_t packetIdPubR = mqttClient.publish("peristaltica/status", 1, true, "Connected to MQTT");
+/*
+  mqttClient.publish("test/lol", 0, true, "test 1");
+  Serial.println("Publishing at QoS 0");
+  uint16_t packetIdPub1 = mqttClient.publish("test/lol", 1, true, "test 2");
+  Serial.print("Publishing at QoS 1, packetId: ");
+  Serial.println(packetIdPub1);
+  uint16_t packetIdPub2 = mqttClient.publish("test/lol", 2, true, "test 3");
+  Serial.print("Publishing at QoS 2, packetId: ");
+  Serial.println(packetIdPub2);
+*/
+}
 
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("Disconnected from MQTT.");
+
+  if (WiFi.isConnected()) {
+    xTimerStart(mqttReconnectTimer, 0);
+  }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+  Serial.println("Subscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+  Serial.print("  qos: ");
+  Serial.println(qos);
+}
+
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+    
+  /*
+    Serial.println("Publish received.");
+    Serial.print("  topic: ");
+    Serial.println(topic);
+    Serial.print("  payload: ");
+    Serial.println(payload);
+    Serial.print("  qos: ");
+    Serial.println(properties.qos);
+    Serial.print("  dup: ");
+    Serial.println(properties.dup);
+    Serial.print("  retain: ");
+    Serial.println(properties.retain);
+    Serial.print("  len: ");
+    Serial.println(len);
+    Serial.print("  index: ");
+    Serial.println(index);
+    Serial.print("  total: ");
+    Serial.println(total);
+  */
+    callback(topic, payload, len);
+
+}
+
+void onMqttPublish(uint16_t packetId) {
+/*
+  Serial.println("Publish acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+*/
+}
 
 
 void MQTTSetup()
 {
-  mqtt_client.setServer(mqtt_server, 1883);
-  mqtt_client.subscribe("peristaltica/action");
-  mqtt_client.setCallback(callback);
+  
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onSubscribe(onMqttSubscribe);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.onPublish(onMqttPublish);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCredentials(mqtt_user, mqtt_password);
+
   
 }
 
@@ -666,36 +736,60 @@ void StepperSetup()
   stepper1.setSpeedInStepsPerSecond(SPEED_IN_STEPS_PER_SECOND);
   stepper1.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
   stepper1.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
-  stepper1.registerTargetPositionReachedCallback(targetPositionReachedCallback);
+  stepper1.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper1);
   stepper1.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
 
   stepper2.connectToPins(Step2, Dir2);
   stepper2.setSpeedInStepsPerSecond(SPEED_IN_STEPS_PER_SECOND);
   stepper2.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
   stepper2.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
-  stepper2.registerTargetPositionReachedCallback(targetPositionReachedCallback);
+  stepper2.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper2);
   stepper2.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
 
   stepper3.connectToPins(Step3, Dir3);
   stepper3.setSpeedInStepsPerSecond(SPEED_IN_STEPS_PER_SECOND);
   stepper3.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
   stepper3.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
-  stepper3.registerTargetPositionReachedCallback(targetPositionReachedCallback);
+  stepper3.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper3);
   stepper3.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
 
-  stepper1.startAsService(0);
-  stepper2.startAsService(0);
-  stepper3.startAsService(0);
+  stepper1.startAsService(1);
+  stepper2.startAsService(1);
+  stepper3.startAsService(1);
 }
 
 
 
+void core0assignments( void * pvParameters ) { 
+for (;;) {
+  
+  ArduinoOTA.handle();
+  
+  }
+}
+
 
 void setup() {
+  
+  disableCore0WDT();            //disable the watchdog time on core 0
+
+  xTaskCreatePinnedToCore(
+   core0assignments,        // Function that should be called
+   "Core_0",          // Name of the task (for debugging)
+   10000,                   // Stack size (bytes)
+   NULL,                   // Parameter to pass
+   1,                      // Task priority//0
+   &C0,                 // Task handle
+   0);                     // Core you want to run the task on (0 or 1)
+  
+
+
+  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
 
   SerialSetup();
   MQTTSetup();                 //Configure MQTT broker  
-  WifiSetup();                 // Start a Wi-Fi access point, and try to connect 
+  connectToWifi();                 // Start a Wi-Fi access point, and try to connect 
   OTASetup();                  //Start Over The Air updater service
   StepperSetup();              //Configure Stepper motors
   EepromRead();                //retrieve data from EEPROM
@@ -703,13 +797,7 @@ void setup() {
 
 
 void loop() {
-  ArduinoOTA.handle();
   
-  if (!mqtt_client.connected()) {
-    mqtt_reconnect();
-  }
-  mqtt_client.loop();
-
   checkProgress();
 
 }

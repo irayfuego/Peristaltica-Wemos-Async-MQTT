@@ -51,20 +51,18 @@
 typedef void (*callbackFunction)(void);
 typedef void (*positionCallbackFunction)(long);
 
-static bool core_0_wdt_was_disabled_from_flexyStepper = 0;
-
 class ESP_FlexyStepper
 {
 public:
   ESP_FlexyStepper();
   ~ESP_FlexyStepper();
   //service functions
-  void startAsService(int core= (-1) ); //If the user does not specify the desired kernel as a parameter, then the free one will be selected
+  bool startAsService(int coreNumber = 1);
   void stopService(void);
   bool isStartedAsService(void);
 
   //IO setup and helper / debugging functions
-  void connectToPins(byte stepPinNumber, byte directionPinNumber);
+  void connectToPins(byte stepPinNumber, byte directionPinNumber=255);
   void setBrakePin(byte brakePin, byte activeState = ESP_FlexyStepper::ACTIVE_HIGH);
   long getTaskStackHighWaterMark(void);
   void clearLimitSwitchActive(void);
@@ -119,7 +117,7 @@ public:
 
   void startJogging(signed char direction);
   void stopJogging();
-  void goToLimitAndSetAsHome(callbackFunction callbackFunctionForHome = NULL);
+  void goToLimitAndSetAsHome(callbackFunction callbackFunctionForHome = NULL, long maxDistanceToMoveInSteps = 2000000000L);
   void goToLimit(signed char direction, callbackFunction callbackFunctionForLimit = NULL);
   
 
@@ -133,6 +131,10 @@ public:
   void setTargetPositionRelativeInSteps(long distanceToMoveInSteps);
   void setTargetPositionRelativeInMillimeters(float distanceToMoveInMillimeters);
   void setTargetPositionRelativeInRevolutions(float distanceToMoveInRevolutions);
+
+  long getTargetPositionInSteps();
+  float getTargetPositionInMillimeters();
+  float getTargetPositionInRevolutions();
 
   //blocking function calls
   void moveToPositionInSteps(long absolutePositionToMoveToInSteps);
@@ -202,6 +204,7 @@ private:
   bool isOnWayToHome = false;
   bool isOnWayToLimit = false;
   bool firstProcessingAfterTargetReached = true;
+  //The type ID of the limit switch type that is active. possible values are LIMIT_SWITCH_BEGIN (-1) or LIMIT_SWITCH_END (1) or LIMIT_SWITCH_COMBINED_BEGIN_AND_END (2) or 0 if no limit switch is active
   signed char activeLimitSwitch;
   bool limitSwitchCheckPeformed;
   // 0 if the the stepper is allowed to move in both directions (e.g. no limit or homing switch triggered), otherwise indicated which direction is currently not allowed for further movement
