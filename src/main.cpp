@@ -76,7 +76,6 @@ long TargetSteps1;
 long TargetSteps2;
 long TargetSteps3;
 int StepperStopped;
-byte ChannelStopped;
 bool Stepper1Running = false;
 bool Stepper2Running = false;
 bool Stepper3Running = false;
@@ -84,9 +83,9 @@ bool Stepper3Running = false;
 
 //EEPROM addresses - Size of uint32_t is 4 positions. All varibles stored in EEPROM are uint32_t type
 #define EEPROM_SIZE 512
-int EepromStepsPerMili1 = 0;                   //Steps per mililitre in Stepper 1
-int EepromStepsPerMili2 = 10;                   //Steps per mililitre in Stepper 2
-int EepromStepsPerMili3 = 20;                   //Steps per mililitre in Stepper 3
+int EepromStepsPerMili1 = 0;                   //Steps per mililitre in Stepper 1 (addr 0, 4 bytes)
+int EepromStepsPerMili2 = 4;                   //Steps per mililitre in Stepper 2 (addr 4, 4 bytes)
+int EepromStepsPerMili3 = 8;                   //Steps per mililitre in Stepper 3 (addr 8, 4 bytes)
 
 
 
@@ -216,51 +215,38 @@ void OTASetup()
 
 
 
-void targetPositionReachedCallback()
-{     
-    
-
-    //disable steppers if all are not moving
+void targetPositionReachedCallback(byte channel)
+{
     if (Stepper1Running == false && Stepper2Running == false && Stepper3Running == false)
     {
-      digitalWrite(EnableStepper, HIGH);  
-    }	
-  
-    
-    char tempJsonStringDone[256];    
+      digitalWrite(EnableStepper, HIGH);
+    }
+
+    char tempJsonStringDone[256];
     StaticJsonDocument<256> ResponseDone;
     ResponseDone["type"] = "done";
     ResponseDone["action"] = "run";
-    ResponseDone["channel"] = ChannelStopped;
-    ResponseDone["progress"] = 100;  
+    ResponseDone["channel"] = channel;
+    ResponseDone["progress"] = 100;
 
-    size_t n = serializeJson(ResponseDone, tempJsonStringDone);    
+    size_t n = serializeJson(ResponseDone, tempJsonStringDone);
     uint16_t packetIdPubDN = mqttClient.publish("peristaltica/status", 1, true, tempJsonStringDone);
-
-  //  Serial.print("targetPositionReachedCallback: ");
-  //  Serial.println(tempJsonStringDone);  
-
 }
 
 void targetPositionReachedCallbackStepper1(long position)
 {
   Stepper1Running = false;
-  ChannelStopped = 1;
-  targetPositionReachedCallback();
-
+  targetPositionReachedCallback(1);
 }
 void targetPositionReachedCallbackStepper2(long position)
 {
   Stepper2Running = false;
-  ChannelStopped = 2;  
-  targetPositionReachedCallback();
- 
+  targetPositionReachedCallback(2);
 }
 void targetPositionReachedCallbackStepper3(long position)
 {
   Stepper3Running = false;
-  ChannelStopped = 3;
-  targetPositionReachedCallback();
+  targetPositionReachedCallback(3);
 }
 
 
@@ -275,26 +261,19 @@ void emergencyStopTriggerdCallbackFunction ()
   int progressStop;
 
   if (StepperStopped == 1){
-      long CurrentSteps1;
-      CurrentSteps1 = stepper1.getCurrentPositionInSteps() ;
-      if (Stepper1Running == true){
-        progressStop = round(100 * (CurrentSteps1 - InitialSteps1)/(TargetSteps1 - InitialSteps1));
-      }
-        
+      long CurrentSteps1 = stepper1.getCurrentPositionInSteps();
+      if (TargetSteps1 != InitialSteps1)
+        progressStop = round(100 * (CurrentSteps1 - InitialSteps1) / (float)(TargetSteps1 - InitialSteps1));
   }
   else if (StepperStopped == 2){
-      long CurrentSteps2;
-      CurrentSteps2 = stepper2.getCurrentPositionInSteps() ;
-      if (Stepper2Running == true){
-        progressStop = round(100 * (CurrentSteps2 - InitialSteps2)/(TargetSteps2 - InitialSteps2));
-      }
+      long CurrentSteps2 = stepper2.getCurrentPositionInSteps();
+      if (TargetSteps2 != InitialSteps2)
+        progressStop = round(100 * (CurrentSteps2 - InitialSteps2) / (float)(TargetSteps2 - InitialSteps2));
   }
-  else if (StepperStopped == 3){    
-      long CurrentSteps3;
-      CurrentSteps3 = stepper3.getCurrentPositionInSteps() ;
-      if (Stepper3Running == true){
-        progressStop = round(100 * (CurrentSteps3 - InitialSteps3)/(TargetSteps3 - InitialSteps3));
-      }
+  else if (StepperStopped == 3){
+      long CurrentSteps3 = stepper3.getCurrentPositionInSteps();
+      if (TargetSteps3 != InitialSteps3)
+        progressStop = round(100 * (CurrentSteps3 - InitialSteps3) / (float)(TargetSteps3 - InitialSteps3));
   }
 
 
@@ -471,9 +450,9 @@ void CallAction ()
         StepsToMove1 =   VolumeMl1 * StepsPerMili1;
         Stepper1Running = true;
         stepper1.setSpeedInStepsPerSecond(SpeedToMove1);
-        stepper1.setTargetPositionRelativeInSteps(StepsToMove1);
-        InitialSteps1 = stepper1.getCurrentPositionInSteps() ;
+        InitialSteps1 = stepper1.getCurrentPositionInSteps();
         TargetSteps1 = InitialSteps1 + StepsToMove1;
+        stepper1.setTargetPositionRelativeInSteps(StepsToMove1);
           
       }
       else if (Channel == 2){
@@ -484,11 +463,11 @@ void CallAction ()
         }  
         SpeedToMove2 = round(SpeedMlperMin2 * StepsPerMili2 / 60);
         StepsToMove2 =   VolumeMl2 * StepsPerMili2;
-        Stepper2Running = true;        
+        Stepper2Running = true;
         stepper2.setSpeedInStepsPerSecond(SpeedToMove2);
-        stepper2.setTargetPositionRelativeInSteps(StepsToMove2);
-        InitialSteps2 = stepper2.getCurrentPositionInSteps() ;
+        InitialSteps2 = stepper2.getCurrentPositionInSteps();
         TargetSteps2 = InitialSteps2 + StepsToMove2;
+        stepper2.setTargetPositionRelativeInSteps(StepsToMove2);
 
       }
       else if (Channel == 3){
@@ -499,11 +478,11 @@ void CallAction ()
         }  
         SpeedToMove3 = round(SpeedMlperMin3 * StepsPerMili3 / 60);
         StepsToMove3 =   VolumeMl3 * StepsPerMili3;
-        Stepper3Running = true;        
+        Stepper3Running = true;
         stepper3.setSpeedInStepsPerSecond(SpeedToMove3);
-        stepper3.setTargetPositionRelativeInSteps(StepsToMove3);
-        InitialSteps3 = stepper3.getCurrentPositionInSteps() ;
+        InitialSteps3 = stepper3.getCurrentPositionInSteps();
         TargetSteps3 = InitialSteps3 + StepsToMove3;
+        stepper3.setTargetPositionRelativeInSteps(StepsToMove3);
 
       }
 
@@ -516,8 +495,9 @@ void CallAction ()
      if (Channel == 1){
               
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili1, StepsPerMili1);
+        EEPROM.put(EepromStepsPerMili1, StepsPerMili1);
         EEPROM.commit();
+        EEPROM.end();
 
         CalibrateFeedbackData["channel"] = 1;
             
@@ -525,8 +505,9 @@ void CallAction ()
       else if (Channel == 2){
 
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili2, StepsPerMili2);
+        EEPROM.put(EepromStepsPerMili2, StepsPerMili2);
         EEPROM.commit();
+        EEPROM.end();
 
         CalibrateFeedbackData["channel"] = 2;
 
@@ -534,8 +515,9 @@ void CallAction ()
       else if (Channel == 3){
         
         EEPROM.begin(EEPROM_SIZE);
-        EEPROM.write (EepromStepsPerMili3, StepsPerMili3);
+        EEPROM.put(EepromStepsPerMili3, StepsPerMili3);
         EEPROM.commit();
+        EEPROM.end();
 
         CalibrateFeedbackData["channel"] = 3;
 
@@ -559,7 +541,7 @@ void CallAction ()
         StepperStopped = 0;
         Stepper1Running = false;
         Stepper2Running = false;
-        Stepper2Running = false;
+        Stepper3Running = false;
         stepper1.emergencyStop();
         stepper2.emergencyStop();
         stepper3.emergencyStop();
@@ -716,9 +698,9 @@ void EepromRead()
 {
   EEPROM.begin(EEPROM_SIZE);
   
-  StepsPerMili1 = EEPROM.read( EepromStepsPerMili1);
-  StepsPerMili2 = EEPROM.read( EepromStepsPerMili2);
-  StepsPerMili3 = EEPROM.read( EepromStepsPerMili3);
+  EEPROM.get(EepromStepsPerMili1, StepsPerMili1);
+  EEPROM.get(EepromStepsPerMili2, StepsPerMili2);
+  EEPROM.get(EepromStepsPerMili3, StepsPerMili3);
   
   EEPROM.end();    
 
@@ -760,11 +742,10 @@ void StepperSetup()
 
 
 
-void core0assignments( void * pvParameters ) { 
-for (;;) {
-  
-  ArduinoOTA.handle();
-  
+void core0assignments( void * pvParameters ) {
+  for (;;) {
+    ArduinoOTA.handle();
+    vTaskDelay(1);
   }
 }
 
@@ -797,7 +778,6 @@ void setup() {
 
 
 void loop() {
-  
   checkProgress();
-
+  delay(1);
 }
