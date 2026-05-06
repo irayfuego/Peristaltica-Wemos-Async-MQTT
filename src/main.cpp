@@ -4,7 +4,6 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
-#include <EEPROM.h>
 #include <Preferences.h>
 #include <WiFiManager.h>
 #include <ESPAsyncWebServer.h>
@@ -84,12 +83,20 @@ long SpeedToMove1,  SpeedToMove2,  SpeedToMove3;
 long InitialSteps1, InitialSteps2, InitialSteps3;
 long TargetSteps1,  TargetSteps2,  TargetSteps3;
 int  StepperStopped;
-bool Stepper1Running = false, Stepper2Running = false, Stepper3Running = false;
+volatile bool Stepper1Running = false, Stepper2Running = false, Stepper3Running = false;
 int  Progress1 = 0, Progress2 = 0, Progress3 = 0;
 
-// ---- EEPROM ----
-#define EEPROM_SIZE 512
-const int EepromStepsPerMili1 = 0, EepromStepsPerMili2 = 4, EepromStepsPerMili3 = 8;
+// MQTT publish deferred from stepper-task callbacks to loop()
+struct PendingMqttEvent {
+    bool     pending;
+    char     event;     // 'D' = run done, 'S' = stop
+    uint8_t  channel;
+    int      progress;
+};
+volatile PendingMqttEvent pendingMqtt[3] = {{false,0,0,0},{false,0,0,0},{false,0,0,0}};
+
+// ---- Calibration storage keys (in Preferences "peristaltica") ----
+const char* CAL_KEY[3] = { "spm1", "spm2", "spm3" };
 
 // ---- Speed defaults ----
 const int SPEED_IN_STEPS_PER_SECOND        = 2000;
@@ -336,7 +343,7 @@ Schedule schedules[MAX_SCHEDULES];
 
 static void resetSchedule(Schedule& s) {
     s.enabled = false; s.channel = 1; s.days = 0;
-    s.hour = 0; s.minute = 0; s.volume = 0; s.speed = 1;
+    s.hour = 0; s.minute = 0; s.volume = 0; s.speed = 10;
     strlcpy(s.direction, "cw", sizeof(s.direction));
     s.moistureThreshold = 0;
 }
@@ -378,7 +385,7 @@ void loadSchedules() {
         schedules[i].hour              = doc["hr"]  | 0;
         schedules[i].minute            = doc["mn"]  | 0;
         schedules[i].volume            = doc["vol"] | 0.0f;
-        schedules[i].speed             = doc["spd"] | 1.0f;
+        schedules[i].speed             = doc["spd"] | 10.0f;
         schedules[i].moistureThreshold = doc["mth"] | 0;
         strlcpy(schedules[i].direction, doc["dir"] | "cw", 4);
     }
@@ -411,12 +418,28 @@ void applyTimezone() {
     tzset();
 }
 
+// Returns true when the system clock has been set from a valid source
+// (year >= 2024). Avoids the magic 100000-seconds heuristic.
+static bool ntpSynced() {
+    struct tm t;
+    return getLocalTime(&t, 0) && (t.tm_year + 1900) >= 2024;
+}
+
 void setupNTP() {
     applyTimezone();
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+}
+
+// Optional: block briefly while waiting for first sync. Used by setup() if
+// you prefer to log the result to serial; safe to skip — checkSchedules()
+// already guards against pre-sync ticks.
+static void waitForNTP(uint32_t timeoutMs = 10000) {
     Serial.print("NTP sync");
-    for (int i = 0; i < 20 && time(nullptr) < 100000; i++) { delay(500); Serial.print("."); }
-    Serial.println(time(nullptr) > 100000 ? " OK" : " timeout");
+    uint32_t start = millis();
+    while (!ntpSynced() && millis() - start < timeoutMs) {
+        delay(500); Serial.print(".");
+    }
+    Serial.println(ntpSynced() ? " OK" : " timeout");
 }
 
 void checkSchedules() {
@@ -957,11 +980,15 @@ void doStop(int ch) {
 }
 
 void doCalibrate(int ch, long spm) {
-    EEPROM.begin(EEPROM_SIZE);
-    if(ch==1){StepsPerMili1=spm;EEPROM.put(EepromStepsPerMili1,spm);}
-    else if(ch==2){StepsPerMili2=spm;EEPROM.put(EepromStepsPerMili2,spm);}
-    else if(ch==3){StepsPerMili3=spm;EEPROM.put(EepromStepsPerMili3,spm);}
-    EEPROM.commit(); EEPROM.end();
+    if (ch < 1 || ch > 3 || spm <= 0) return;
+    if (ch==1) StepsPerMili1=spm;
+    else if (ch==2) StepsPerMili2=spm;
+    else StepsPerMili3=spm;
+    PREFS_LOCK();
+    prefs.begin("peristaltica", false);
+    prefs.putLong(CAL_KEY[ch-1], spm);
+    prefs.end();
+    PREFS_UNLOCK();
 }
 
 
@@ -969,40 +996,54 @@ void doCalibrate(int ch, long spm) {
 // STEPPER CALLBACKS
 // =========================================================
 
-void targetPositionReachedCallback(byte channel) {
-    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
-    if(!mqttEnabled) return;
-    char buf[128]; StaticJsonDocument<128> doc;
-    doc["type"]="done"; doc["action"]="run"; doc["channel"]=channel; doc["progress"]=100;
-    serializeJson(doc,buf); mqttClient.publish("peristaltica/status",1,true,buf);
+// Stepper callbacks run in the stepper-service task. Keep them tiny:
+// just record state and queue an MQTT event; loop() publishes later.
+static void queueEvent(int ch, char ev, int ps) {
+    pendingMqtt[ch-1].channel  = ch;
+    pendingMqtt[ch-1].event    = ev;
+    pendingMqtt[ch-1].progress = ps;
+    pendingMqtt[ch-1].pending  = true;
 }
 
-void targetPositionReachedCallbackStepper1(long){Progress1=100;Stepper1Running=false;targetPositionReachedCallback(1);}
-void targetPositionReachedCallbackStepper2(long){Progress2=100;Stepper2Running=false;targetPositionReachedCallback(2);}
-void targetPositionReachedCallbackStepper3(long){Progress3=100;Stepper3Running=false;targetPositionReachedCallback(3);}
-
-static void publishStopDone(int ch, int ps) {
-    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
-    if(!mqttEnabled) return;
-    char buf[128]; StaticJsonDocument<128> doc;
-    doc["type"]="done"; doc["action"]="stop"; doc["channel"]=ch; doc["progress"]=ps;
-    serializeJson(doc,buf); mqttClient.publish("peristaltica/status",1,true,buf);
-}
+void targetPositionReachedCallbackStepper1(long){Progress1=100;Stepper1Running=false;queueEvent(1,'D',100);}
+void targetPositionReachedCallbackStepper2(long){Progress2=100;Stepper2Running=false;queueEvent(2,'D',100);}
+void targetPositionReachedCallbackStepper3(long){Progress3=100;Stepper3Running=false;queueEvent(3,'D',100);}
 
 void emergencyStopCallback1() {
     int ps = (TargetSteps1!=InitialSteps1)
         ? Progress1=round(100*(stepper1.getCurrentPositionInSteps()-InitialSteps1)/(float)(TargetSteps1-InitialSteps1)) : 0;
-    publishStopDone(1, ps);
+    queueEvent(1, 'S', ps);
 }
 void emergencyStopCallback2() {
     int ps = (TargetSteps2!=InitialSteps2)
         ? Progress2=round(100*(stepper2.getCurrentPositionInSteps()-InitialSteps2)/(float)(TargetSteps2-InitialSteps2)) : 0;
-    publishStopDone(2, ps);
+    queueEvent(2, 'S', ps);
 }
 void emergencyStopCallback3() {
     int ps = (TargetSteps3!=InitialSteps3)
         ? Progress3=round(100*(stepper3.getCurrentPositionInSteps()-InitialSteps3)/(float)(TargetSteps3-InitialSteps3)) : 0;
-    publishStopDone(3, ps);
+    queueEvent(3, 'S', ps);
+}
+
+// Drain any queued MQTT events. Called from loop() (Core 1).
+void publishPendingMqttEvents() {
+    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
+    if(!mqttEnabled) {
+        for (int i=0; i<3; i++) pendingMqtt[i].pending = false;
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!pendingMqtt[i].pending) continue;
+        PendingMqttEvent ev = const_cast<PendingMqttEvent&>(pendingMqtt[i]);
+        pendingMqtt[i].pending = false;
+        char buf[128]; StaticJsonDocument<128> doc;
+        doc["type"]   = "done";
+        doc["action"] = (ev.event == 'D') ? "run" : "stop";
+        doc["channel"] = ev.channel;
+        doc["progress"] = ev.progress;
+        serializeJson(doc, buf);
+        mqttClient.publish("peristaltica/status", 1, true, buf);
+    }
 }
 
 
@@ -1079,6 +1120,7 @@ void setupWebServer() {
     webServer.on("/api/schedules", HTTP_GET, [](AsyncWebServerRequest* req){
         StaticJsonDocument<2048> doc; JsonArray arr=doc.to<JsonArray>();
         for(int i=0;i<MAX_SCHEDULES;i++){
+            if (schedules[i].days == 0) continue; // skip empty slots
             JsonObject o=arr.createNestedObject();
             o["id"]=i; o["enabled"]=schedules[i].enabled; o["channel"]=schedules[i].channel;
             o["days"]=schedules[i].days; o["hour"]=schedules[i].hour; o["minute"]=schedules[i].minute;
@@ -1178,15 +1220,21 @@ void setupWebServer() {
         String path=req->url();
 
         if(path=="/api/run"){
-            doRun(doc["channel"]|0,doc["volume"]|0.0f,doc["speed"]|0.0f,doc["direction"]|"cw");
+            int ch=doc["channel"]|0;
+            if(ch<1||ch>3){req->send(400,"application/json","{\"ok\":false,\"error\":\"bad_channel\"}");return;}
+            doRun(ch,doc["volume"]|0.0f,doc["speed"]|0.0f,doc["direction"]|"cw");
             req->send(200,"application/json","{\"ok\":true}");
         }
         else if(path=="/api/stop"){
-            doStop(doc["channel"]|0);
+            int ch=doc["channel"]|0;
+            if(ch<0||ch>3){req->send(400,"application/json","{\"ok\":false,\"error\":\"bad_channel\"}");return;}
+            doStop(ch);
             req->send(200,"application/json","{\"ok\":true}");
         }
         else if(path=="/api/calibrate"){
-            doCalibrate(doc["channel"]|0,doc["stepsperml"]|1600L);
+            int ch=doc["channel"]|0;
+            if(ch<1||ch>3){req->send(400,"application/json","{\"ok\":false,\"error\":\"bad_channel\"}");return;}
+            doCalibrate(ch,doc["stepsperml"]|1600L);
             req->send(200,"application/json","{\"ok\":true}");
         }
         else if(path=="/api/config"){
@@ -1199,6 +1247,9 @@ void setupWebServer() {
         }
         else if(path=="/api/schedules"){
             int id=doc["id"]|-1;
+            if(doc.containsKey("channel")){
+                int c=doc["channel"]; if(c<1||c>3){req->send(400,"application/json","{\"ok\":false,\"error\":\"bad_channel\"}");return;}
+            }
             if(id>=0&&id<MAX_SCHEDULES){
                 if(doc.containsKey("enabled"))  schedules[id].enabled=doc["enabled"];
                 if(doc.containsKey("days"))     schedules[id].days=doc["days"];
@@ -1216,7 +1267,7 @@ void setupWebServer() {
                     if(schedules[i].days!=0)continue;
                     schedules[i].enabled=doc["enabled"]|true; schedules[i].channel=doc["channel"]|1;
                     schedules[i].days=doc["days"]|0; schedules[i].hour=doc["hour"]|0; schedules[i].minute=doc["minute"]|0;
-                    schedules[i].volume=doc["volume"]|0.0f; schedules[i].speed=doc["speed"]|1.0f;
+                    schedules[i].volume=doc["volume"]|0.0f; schedules[i].speed=doc["speed"]|10.0f;
                     schedules[i].moistureThreshold=doc["moistureThreshold"]|0;
                     strlcpy(schedules[i].direction,doc["direction"]|"cw",4);
                     saveSchedule(i); ok=true;
@@ -1263,7 +1314,9 @@ void setupWebServer() {
         }
         else if(path=="/api/resetwifi"){
             req->send(200,"application/json","{\"ok\":true}");
-            delay(500); WiFiManager wm; wm.resetSettings(); ESP.restart();
+            delay(500);
+            WiFi.disconnect(true, true); // erase NVS WiFi creds + AP config
+            ESP.restart();
         }
         else { req->send(404); }
     };
@@ -1290,6 +1343,7 @@ void setupWebServer() {
 
 void connectToMqtt() {
     if(!mqttEnabled)return;
+    if(mqttClient.connected())return;
     Serial.println("Connecting to MQTT..."); mqttClient.connect();
 }
 void startMqtt() {
@@ -1402,15 +1456,17 @@ void StepperSetup() {
 // EEPROM
 // =========================================================
 
-void EepromRead() {
-    EEPROM.begin(EEPROM_SIZE);
-    EEPROM.get(EepromStepsPerMili1,StepsPerMili1);
-    EEPROM.get(EepromStepsPerMili2,StepsPerMili2);
-    EEPROM.get(EepromStepsPerMili3,StepsPerMili3);
-    EEPROM.end();
-    if(StepsPerMili1<=0)StepsPerMili1=1600;
-    if(StepsPerMili2<=0)StepsPerMili2=1600;
-    if(StepsPerMili3<=0)StepsPerMili3=1600;
+void loadCalibration() {
+    PREFS_LOCK();
+    prefs.begin("peristaltica", true);
+    StepsPerMili1 = prefs.getLong(CAL_KEY[0], 1600);
+    StepsPerMili2 = prefs.getLong(CAL_KEY[1], 1600);
+    StepsPerMili3 = prefs.getLong(CAL_KEY[2], 1600);
+    prefs.end();
+    PREFS_UNLOCK();
+    if (StepsPerMili1 <= 0) StepsPerMili1 = 1600;
+    if (StepsPerMili2 <= 0) StepsPerMili2 = 1600;
+    if (StepsPerMili3 <= 0) StepsPerMili3 = 1600;
 }
 
 
@@ -1432,6 +1488,17 @@ void setup() {
 
     WiFi.onEvent(WiFiEvent);
 
+    // Load all persistent state first so the captive portal / web UI / steppers
+    // can all see calibrations, schedules, sensors and MQTT config from the
+    // moment they come online.
+    loadMqttConfig();
+    loadCalibration();
+    loadSchedules();
+    loadSensorConfigs();
+
+    // Start steppers early; they're independent of network state.
+    StepperSetup();
+
     WiFiManager wm;
     wm.setConfigPortalTimeout(180); wm.setConnectTimeout(30); wm.setHostname("Peristaltica");
     if(!wm.autoConnect("Peristaltica-Setup")){
@@ -1439,29 +1506,21 @@ void setup() {
     }
 
     // MQTT
-    loadMqttConfig();
     mqttClient.onConnect(onMqttConnect); mqttClient.onDisconnect(onMqttDisconnect); mqttClient.onMessage(onMqttMessage);
     startMqtt();
 
-    // NTP + schedules
+    // Kick off NTP — non-blocking; checkSchedules() guards itself against pre-sync
     setupNTP();
-    loadSchedules();
 
     // BLE (NimBLE init — must be after WiFi for coexistence)
     NimBLEDevice::init("");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9); // max TX power for better range
-    loadSensorConfigs();
 
-    // OTA
+    // OTA + web server come up immediately so the device is reachable
+    // even if NTP is still syncing.
     ArduinoOTA.setHostname("Peristaltica");
     ArduinoOTA.begin();
-
-    // Web server
     setupWebServer();
-
-    // Steppers + EEPROM
-    StepperSetup();
-    EepromRead();
 
     Serial.print("Ready — http://"); Serial.println(WiFi.localIP());
 }
@@ -1472,6 +1531,7 @@ void setup() {
 // =========================================================
 
 void loop() {
+    publishPendingMqttEvents();
     checkProgress();
     checkSchedules();
     checkSensorTimer();
