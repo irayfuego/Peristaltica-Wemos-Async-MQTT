@@ -14,8 +14,18 @@
 extern "C" {
     #include "freertos/FreeRTOS.h"
     #include "freertos/timers.h"
+    #include "freertos/semphr.h"
+    #include "esp_task_wdt.h"
 }
 #include <AsyncMqttClient.h>
+
+// ---- Mutex protecting global Preferences instance + sensorData/scanResults ----
+SemaphoreHandle_t prefsMutex   = nullptr;
+SemaphoreHandle_t sensorMutex  = nullptr;
+#define PREFS_LOCK()    xSemaphoreTake(prefsMutex,  portMAX_DELAY)
+#define PREFS_UNLOCK()  xSemaphoreGive(prefsMutex)
+#define SENSOR_LOCK()   xSemaphoreTake(sensorMutex, portMAX_DELAY)
+#define SENSOR_UNLOCK() xSemaphoreGive(sensorMutex)
 
 // ---- MQTT client ----
 AsyncMqttClient mqttClient;
@@ -34,22 +44,26 @@ bool   mqttEnabled = false;
 Preferences prefs;
 
 void loadMqttConfig() {
+    PREFS_LOCK();
     prefs.begin("peristaltica", true);
     mqttServer = prefs.getString("mqtt_srv", "");
     mqttPort   = prefs.getInt("mqtt_port", MQTT_PORT_DEFAULT);
     mqttUser   = prefs.getString("mqtt_usr", "");
     mqttPass   = prefs.getString("mqtt_pwd", "");
     prefs.end();
+    PREFS_UNLOCK();
     mqttEnabled = mqttServer.length() > 0;
 }
 
 void saveMqttConfig(const String& srv, int port, const String& usr, const String& pwd) {
+    PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.putString("mqtt_srv", srv);
     prefs.putInt("mqtt_port", port);
     prefs.putString("mqtt_usr", usr);
     prefs.putString("mqtt_pwd", pwd);
     prefs.end();
+    PREFS_UNLOCK();
     mqttServer  = srv;  mqttPort = port;
     mqttUser    = usr;  mqttPass = pwd;
     mqttEnabled = srv.length() > 0;
@@ -83,6 +97,14 @@ const int ACCELERATION_IN_STEPS_PER_SECOND = 800;
 const int DECELERATION_IN_STEPS_PER_SECOND = 800;
 
 ESP_FlexyStepper stepper1, stepper2, stepper3;
+
+// Cached driver-enable line state. EN is active-LOW.
+static int enableStepperState = HIGH;
+static inline void setEnableStepper(int level) {
+    if (level == enableStepperState) return;
+    enableStepperState = level;
+    digitalWrite(EnableStepper, level);
+}
 
 // ---- Progress timing ----
 long ProgressPreviousMillis = 0;
@@ -138,19 +160,21 @@ void saveSensorConfig(int ch) {   // ch = 0..2
     doc["thr"]  = sensorCfg[ch].threshold;
     doc["asgn"] = sensorCfg[ch].assigned;
     char buf[192]; serializeJson(doc, buf);
+    PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.putString(key, buf);
     prefs.end();
+    PREFS_UNLOCK();
 }
 
 void loadSensorConfigs() {
+    PREFS_LOCK();
+    prefs.begin("peristaltica", true);
     for (int i = 0; i < 3; i++) {
         sensorCfg[i]  = {{0}, {0}, 0, false};
         sensorData[i] = {0, 0, 0, 0, false, 0};
         char key[12]; sprintf(key, "sensor_%d", i);
-        prefs.begin("peristaltica", true);
         String s = prefs.getString(key, "");
-        prefs.end();
         if (s.length() == 0) continue;
         StaticJsonDocument<192> doc;
         if (deserializeJson(doc, s)) continue;
@@ -159,14 +183,18 @@ void loadSensorConfigs() {
         sensorCfg[i].threshold = doc["thr"]  | 0;
         sensorCfg[i].assigned  = doc["asgn"] | false;
     }
+    prefs.end();
+    PREFS_UNLOCK();
 }
 
 void deleteSensorConfig(int ch) {
     sensorCfg[ch] = {{0}, {0}, 0, false};
     char key[12]; sprintf(key, "sensor_%d", ch);
+    PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.remove(key);
     prefs.end();
+    PREFS_UNLOCK();
 }
 
 // ---------- Mi Flora BLE read ----------
@@ -175,7 +203,6 @@ bool readMiFlora(const char* macStr, SensorReading& r) {
     NimBLEAddress addr(macStr);
     NimBLEClient* client = NimBLEDevice::createClient();
     client->setConnectionParams(16, 16, 0, 60);
-    client->setTimeout(15);
 
     if (!client->connect(addr)) {
         NimBLEDevice::deleteClient(client);
@@ -210,12 +237,14 @@ bool readMiFlora(const char* macStr, SensorReading& r) {
 
     const uint8_t* d = (const uint8_t*)val.data();
     // Byte layout: [0-1]=temp(int16LE/10°C) [2]=0 [3]=moisture% [4-5]=light(uint16LE lux) [6-7]=conductivity(uint16LE µS/cm)
+    SENSOR_LOCK();
     r.temperature   = (int16_t)(d[0] | (d[1] << 8)) / 10.0f;
     r.moisture      = d[3];
     r.light         = (uint32_t)(d[4] | (d[5] << 8));
     r.conductivity  = (uint16_t)(d[6] | (d[7] << 8));
     r.valid         = true;
     r.timestamp     = time(nullptr);
+    SENSOR_UNLOCK();
 
     client->disconnect();
     NimBLEDevice::deleteClient(client);
@@ -235,18 +264,19 @@ void doBleScan() {
 
     NimBLEScanResults results = scan->start(10, false); // 10 seconds
 
+    SENSOR_LOCK();
     int count = 0;
     for (int i = 0; i < results.getCount() && count < MAX_SCAN_RESULTS; i++) {
-        NimBLEAdvertisedDevice* dev = results.getDevice(i);
-        String name = dev->getName().c_str();
-        String addr = dev->getAddress().toString().c_str();
-        // Show all devices (named or unnamed) so user can identify their sensor
+        NimBLEAdvertisedDevice dev = results.getDevice(i);
+        std::string name = dev.getName();
+        std::string addr = dev.getAddress().toString();
         strlcpy(scanResults[count].addr, addr.c_str(), 18);
         strlcpy(scanResults[count].name, name.length() ? name.c_str() : "?", 48);
-        scanResults[count].rssi = dev->getRSSI();
+        scanResults[count].rssi = dev.getRSSI();
         count++;
     }
     scanResultCount = count;
+    SENSOR_UNLOCK();
     scan->clearResults();
     bleScanning = false;
 }
@@ -272,6 +302,17 @@ bool anySensorAssigned() {
     return false;
 }
 
+// "XX:XX:XX:XX:XX:XX" — 17 chars, hex pairs separated by ':'
+bool isValidMac(const char* m) {
+    if (!m || strlen(m) != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        char c = m[i];
+        if ((i % 3) == 2) { if (c != ':') return false; }
+        else { if (!isxdigit((int)c)) return false; }
+    }
+    return true;
+}
+
 
 // =========================================================
 // SCHEDULE
@@ -293,6 +334,13 @@ struct Schedule {
 
 Schedule schedules[MAX_SCHEDULES];
 
+static void resetSchedule(Schedule& s) {
+    s.enabled = false; s.channel = 1; s.days = 0;
+    s.hour = 0; s.minute = 0; s.volume = 0; s.speed = 1;
+    strlcpy(s.direction, "cw", sizeof(s.direction));
+    s.moistureThreshold = 0;
+}
+
 void saveSchedule(int idx) {
     char key[12]; sprintf(key, "sched_%d", idx);
     StaticJsonDocument<256> doc;
@@ -306,18 +354,22 @@ void saveSchedule(int idx) {
     doc["dir"] = schedules[idx].direction;
     doc["mth"] = schedules[idx].moistureThreshold;
     char buf[256]; serializeJson(doc, buf);
+    PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.putString(key, buf);
     prefs.end();
+    PREFS_UNLOCK();
 }
 
 void loadSchedules() {
+    PREFS_LOCK();
+    prefs.begin("peristaltica", true);
     for (int i = 0; i < MAX_SCHEDULES; i++) {
+        // Reset slot first so corrupt JSON also yields a clean default
+        resetSchedule(schedules[i]);
         char key[12]; sprintf(key, "sched_%d", i);
-        prefs.begin("peristaltica", true);
         String s = prefs.getString(key, "");
-        prefs.end();
-        if (s.length() == 0) { schedules[i] = {false,1,0,0,0,0,1,"cw",0}; continue; }
+        if (s.length() == 0) continue;
         StaticJsonDocument<256> doc;
         if (deserializeJson(doc, s)) continue;
         schedules[i].enabled           = doc["en"]  | false;
@@ -330,14 +382,18 @@ void loadSchedules() {
         schedules[i].moistureThreshold = doc["mth"] | 0;
         strlcpy(schedules[i].direction, doc["dir"] | "cw", 4);
     }
+    prefs.end();
+    PREFS_UNLOCK();
 }
 
 void deleteSchedule(int idx) {
-    schedules[idx] = {false,1,0,0,0,0,1,"cw",0};
+    resetSchedule(schedules[idx]);
     char key[12]; sprintf(key, "sched_%d", idx);
+    PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.remove(key);
     prefs.end();
+    PREFS_UNLOCK();
 }
 
 
@@ -346,9 +402,11 @@ void deleteSchedule(int idx) {
 // =========================================================
 
 void applyTimezone() {
+    PREFS_LOCK();
     prefs.begin("peristaltica", true);
     String tz = prefs.getString("timezone", "CET-1CEST,M3.5.0,M10.5.0/3");
     prefs.end();
+    PREFS_UNLOCK();
     setenv("TZ", tz.c_str(), 1);
     tzset();
 }
@@ -365,9 +423,16 @@ void checkSchedules() {
     struct tm t;
     if (!getLocalTime(&t, 0)) return;
 
-    static int lastCheckedMinute = -1;
+    static int  lastCheckedMinute = -1;
+    static bool firstTickConsumed = false;
+
     if (t.tm_min == lastCheckedMinute) return;
     lastCheckedMinute = t.tm_min;
+
+    // First valid tick after boot: just record the minute, don't fire schedules.
+    // Prevents accidentally re-running a schedule whose minute happens to match
+    // when NTP first syncs.
+    if (!firstTickConsumed) { firstTickConsumed = true; return; }
 
     int dow    = (t.tm_wday == 0) ? 6 : t.tm_wday - 1; // 0=Mon…6=Sun
     uint8_t db = 1 << dow;
@@ -381,12 +446,15 @@ void checkSchedules() {
         // Moisture check: skip if soil is already moist enough
         if (schedules[i].moistureThreshold > 0) {
             int ch = schedules[i].channel - 1;
-            if (sensorCfg[ch].assigned && sensorData[ch].valid) {
-                if (sensorData[ch].moisture >= schedules[i].moistureThreshold) {
-                    Serial.printf("Schedule %d skipped: moisture %d%% >= threshold %d%%\n",
-                                  i, sensorData[ch].moisture, schedules[i].moistureThreshold);
-                    continue;
-                }
+            SENSOR_LOCK();
+            bool assigned = sensorCfg[ch].assigned;
+            bool valid    = sensorData[ch].valid;
+            uint8_t m     = sensorData[ch].moisture;
+            SENSOR_UNLOCK();
+            if (assigned && valid && m >= schedules[i].moistureThreshold) {
+                Serial.printf("Schedule %d skipped: moisture %d%% >= threshold %d%%\n",
+                              i, m, schedules[i].moistureThreshold);
+                continue;
             }
         }
 
@@ -859,26 +927,30 @@ poll();
 // =========================================================
 
 void doRun(int ch, float vol, float spd, const char* dir) {
-    bool ccw = String(dir) == "ccw";
-    digitalWrite(EnableStepper, LOW);
+    if (vol <= 0 || spd <= 0) return; // never enable driver with zero step target
+    bool ccw = !strcmp(dir, "ccw");
+    setEnableStepper(LOW);
     if (ch == 1) {
         float v=ccw?-vol:vol; SpeedToMove1=round(spd*StepsPerMili1/60.0f); StepsToMove1=(long)(v*StepsPerMili1);
         InitialSteps1=stepper1.getCurrentPositionInSteps(); TargetSteps1=InitialSteps1+StepsToMove1;
-        Stepper1Running=true; stepper1.setSpeedInStepsPerSecond(SpeedToMove1); stepper1.setTargetPositionRelativeInSteps(StepsToMove1);
+        Progress1=0; Stepper1Running=true;
+        stepper1.setSpeedInStepsPerSecond(SpeedToMove1); stepper1.setTargetPositionRelativeInSteps(StepsToMove1);
     } else if (ch == 2) {
         float v=ccw?-vol:vol; SpeedToMove2=round(spd*StepsPerMili2/60.0f); StepsToMove2=(long)(v*StepsPerMili2);
         InitialSteps2=stepper2.getCurrentPositionInSteps(); TargetSteps2=InitialSteps2+StepsToMove2;
-        Stepper2Running=true; stepper2.setSpeedInStepsPerSecond(SpeedToMove2); stepper2.setTargetPositionRelativeInSteps(StepsToMove2);
+        Progress2=0; Stepper2Running=true;
+        stepper2.setSpeedInStepsPerSecond(SpeedToMove2); stepper2.setTargetPositionRelativeInSteps(StepsToMove2);
     } else if (ch == 3) {
         float v=ccw?-vol:vol; SpeedToMove3=round(spd*StepsPerMili3/60.0f); StepsToMove3=(long)(v*StepsPerMili3);
         InitialSteps3=stepper3.getCurrentPositionInSteps(); TargetSteps3=InitialSteps3+StepsToMove3;
-        Stepper3Running=true; stepper3.setSpeedInStepsPerSecond(SpeedToMove3); stepper3.setTargetPositionRelativeInSteps(StepsToMove3);
+        Progress3=0; Stepper3Running=true;
+        stepper3.setSpeedInStepsPerSecond(SpeedToMove3); stepper3.setTargetPositionRelativeInSteps(StepsToMove3);
     }
 }
 
 void doStop(int ch) {
     if (ch==0) { StepperStopped=0; Stepper1Running=Stepper2Running=Stepper3Running=false;
-        stepper1.emergencyStop(); stepper2.emergencyStop(); stepper3.emergencyStop(); digitalWrite(EnableStepper,HIGH);
+        stepper1.emergencyStop(); stepper2.emergencyStop(); stepper3.emergencyStop(); setEnableStepper(HIGH);
     } else if(ch==1){StepperStopped=1;Stepper1Running=false;stepper1.emergencyStop();}
     else if(ch==2){StepperStopped=2;Stepper2Running=false;stepper2.emergencyStop();}
     else if(ch==3){StepperStopped=3;Stepper3Running=false;stepper3.emergencyStop();}
@@ -898,7 +970,7 @@ void doCalibrate(int ch, long spm) {
 // =========================================================
 
 void targetPositionReachedCallback(byte channel) {
-    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) digitalWrite(EnableStepper,HIGH);
+    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
     if(!mqttEnabled) return;
     char buf[128]; StaticJsonDocument<128> doc;
     doc["type"]="done"; doc["action"]="run"; doc["channel"]=channel; doc["progress"]=100;
@@ -909,16 +981,28 @@ void targetPositionReachedCallbackStepper1(long){Progress1=100;Stepper1Running=f
 void targetPositionReachedCallbackStepper2(long){Progress2=100;Stepper2Running=false;targetPositionReachedCallback(2);}
 void targetPositionReachedCallbackStepper3(long){Progress3=100;Stepper3Running=false;targetPositionReachedCallback(3);}
 
-void emergencyStopTriggerdCallbackFunction() {
-    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) digitalWrite(EnableStepper,HIGH);
-    int ps=0;
-    if(StepperStopped==1&&TargetSteps1!=InitialSteps1) ps=Progress1=round(100*(stepper1.getCurrentPositionInSteps()-InitialSteps1)/(float)(TargetSteps1-InitialSteps1));
-    else if(StepperStopped==2&&TargetSteps2!=InitialSteps2) ps=Progress2=round(100*(stepper2.getCurrentPositionInSteps()-InitialSteps2)/(float)(TargetSteps2-InitialSteps2));
-    else if(StepperStopped==3&&TargetSteps3!=InitialSteps3) ps=Progress3=round(100*(stepper3.getCurrentPositionInSteps()-InitialSteps3)/(float)(TargetSteps3-InitialSteps3));
+static void publishStopDone(int ch, int ps) {
+    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
     if(!mqttEnabled) return;
     char buf[128]; StaticJsonDocument<128> doc;
-    doc["type"]="done"; doc["action"]="stop"; doc["channel"]=StepperStopped; doc["progress"]=ps;
+    doc["type"]="done"; doc["action"]="stop"; doc["channel"]=ch; doc["progress"]=ps;
     serializeJson(doc,buf); mqttClient.publish("peristaltica/status",1,true,buf);
+}
+
+void emergencyStopCallback1() {
+    int ps = (TargetSteps1!=InitialSteps1)
+        ? Progress1=round(100*(stepper1.getCurrentPositionInSteps()-InitialSteps1)/(float)(TargetSteps1-InitialSteps1)) : 0;
+    publishStopDone(1, ps);
+}
+void emergencyStopCallback2() {
+    int ps = (TargetSteps2!=InitialSteps2)
+        ? Progress2=round(100*(stepper2.getCurrentPositionInSteps()-InitialSteps2)/(float)(TargetSteps2-InitialSteps2)) : 0;
+    publishStopDone(2, ps);
+}
+void emergencyStopCallback3() {
+    int ps = (TargetSteps3!=InitialSteps3)
+        ? Progress3=round(100*(stepper3.getCurrentPositionInSteps()-InitialSteps3)/(float)(TargetSteps3-InitialSteps3)) : 0;
+    publishStopDone(3, ps);
 }
 
 
@@ -942,7 +1026,7 @@ void checkProgress() {
         upd(Stepper2Running,stepper2,InitialSteps2,TargetSteps2,Progress2,2);
         upd(Stepper3Running,stepper3,InitialSteps3,TargetSteps3,Progress3,3);
     }
-    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) digitalWrite(EnableStepper,HIGH);
+    if(!Stepper1Running&&!Stepper2Running&&!Stepper3Running) setEnableStepper(HIGH);
 }
 
 // Trigger sensor reads every 15 minutes
@@ -1014,15 +1098,21 @@ void setupWebServer() {
     // GET /api/sensors — config + latest readings for all 3 channels
     webServer.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest* req){
         StaticJsonDocument<1024> doc; JsonArray arr=doc.to<JsonArray>();
+        SENSOR_LOCK();
+        SensorConfig  cfgCopy[3];
+        SensorReading dataCopy[3];
+        memcpy(cfgCopy,  sensorCfg,  sizeof(cfgCopy));
+        memcpy(dataCopy, sensorData, sizeof(dataCopy));
+        SENSOR_UNLOCK();
         for(int i=0;i<3;i++){
             JsonObject o=arr.createNestedObject();
             JsonObject cfg=o.createNestedObject("cfg");
-            cfg["assigned"]=sensorCfg[i].assigned; cfg["mac"]=sensorCfg[i].mac;
-            cfg["name"]=sensorCfg[i].name; cfg["threshold"]=sensorCfg[i].threshold;
+            cfg["assigned"]=cfgCopy[i].assigned; cfg["mac"]=cfgCopy[i].mac;
+            cfg["name"]=cfgCopy[i].name; cfg["threshold"]=cfgCopy[i].threshold;
             JsonObject rd=o.createNestedObject("reading");
-            rd["valid"]=sensorData[i].valid; rd["moisture"]=sensorData[i].moisture;
-            rd["temperature"]=sensorData[i].temperature; rd["light"]=sensorData[i].light;
-            rd["conductivity"]=sensorData[i].conductivity; rd["timestamp"]=(uint32_t)sensorData[i].timestamp;
+            rd["valid"]=dataCopy[i].valid; rd["moisture"]=dataCopy[i].moisture;
+            rd["temperature"]=dataCopy[i].temperature; rd["light"]=dataCopy[i].light;
+            rd["conductivity"]=dataCopy[i].conductivity; rd["timestamp"]=(uint32_t)dataCopy[i].timestamp;
         }
         char buf[1024]; serializeJson(doc,buf); req->send(200,"application/json",buf);
     });
@@ -1039,23 +1129,52 @@ void setupWebServer() {
     webServer.on("/api/ble/results", HTTP_GET, [](AsyncWebServerRequest* req){
         if(bleScanning){req->send(200,"application/json","{\"scanning\":true}");return;}
         StaticJsonDocument<2048> doc; JsonArray arr=doc.to<JsonArray>();
-        for(int i=0;i<scanResultCount;i++){
+        SENSOR_LOCK();
+        int n = scanResultCount;
+        BLEScanResult copy[MAX_SCAN_RESULTS];
+        memcpy(copy, scanResults, sizeof(BLEScanResult)*n);
+        SENSOR_UNLOCK();
+        for(int i=0;i<n;i++){
             JsonObject o=arr.createNestedObject();
-            o["addr"]=scanResults[i].addr; o["name"]=scanResults[i].name; o["rssi"]=scanResults[i].rssi;
+            o["addr"]=copy[i].addr; o["name"]=copy[i].name; o["rssi"]=copy[i].rssi;
         }
         char buf[2048]; serializeJson(doc,buf); req->send(200,"application/json",buf);
     });
 
     webServer.on("/api/timezone", HTTP_GET, [](AsyncWebServerRequest* req){
-        prefs.begin("peristaltica",true); String tz=prefs.getString("timezone","CET-1CEST,M3.5.0,M10.5.0/3"); prefs.end();
+        PREFS_LOCK();
+        prefs.begin("peristaltica",true);
+        String tz=prefs.getString("timezone","CET-1CEST,M3.5.0,M10.5.0/3");
+        prefs.end();
+        PREFS_UNLOCK();
         StaticJsonDocument<128> doc; doc["tz"]=tz;
         char buf[128]; serializeJson(doc,buf); req->send(200,"application/json",buf);
     });
 
-    // POST body handler
-    auto bodyHandler=[](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
-        StaticJsonDocument<256> doc;
-        if(deserializeJson(doc,data,len)){req->send(400,"application/json","{\"ok\":false}");return;}
+    // POST body handler — accumulates chunks until the full body is received,
+    // then parses once. AsyncWebServer can split bodies across multiple calls.
+    auto bodyHandler=[](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total){
+        const size_t MAX_BODY = 1024;
+        if (total > MAX_BODY) { req->send(413,"application/json","{\"ok\":false,\"error\":\"too_large\"}"); return; }
+
+        // Buffer is allocated on first chunk and stored in the request _tempObject.
+        char* buf = (char*) req->_tempObject;
+        if (index == 0) {
+            if (buf) { free(buf); buf = nullptr; }
+            buf = (char*) malloc(total + 1);
+            if (!buf) { req->send(500); return; }
+            req->_tempObject = buf;
+        }
+        if (!buf) return;
+        memcpy(buf + index, data, len);
+        if (index + len < total) return; // wait for more chunks
+        buf[total] = 0;
+
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, buf, total);
+        free(buf); req->_tempObject = nullptr;
+        if (err) { req->send(400,"application/json","{\"ok\":false}"); return; }
+
         String path=req->url();
 
         if(path=="/api/run"){
@@ -1108,10 +1227,18 @@ void setupWebServer() {
         }
         else if(path=="/api/sensors"){
             int ch=doc["channel"]|0;
+            const char* mac = doc["mac"] | "";
             if(ch<0||ch>2){req->send(400);return;}
-            sensorCfg[ch].assigned=true; sensorCfg[ch].threshold=doc["threshold"]|0;
-            strlcpy(sensorCfg[ch].mac,  doc["mac"]  |"", 18);
+            if(!isValidMac(mac)){
+                req->send(400,"application/json","{\"ok\":false,\"error\":\"bad_mac\"}");
+                return;
+            }
+            SENSOR_LOCK();
+            sensorCfg[ch].assigned=true;
+            sensorCfg[ch].threshold=doc["threshold"]|0;
+            strlcpy(sensorCfg[ch].mac,  mac, 18);
             strlcpy(sensorCfg[ch].name, doc["name"] |"", 40);
+            SENSOR_UNLOCK();
             saveSensorConfig(ch);
             bleReadReq=true; // read new sensor immediately
             req->send(200,"application/json","{\"ok\":true}");
@@ -1126,7 +1253,11 @@ void setupWebServer() {
         }
         else if(path=="/api/timezone"){
             String tz=doc["tz"]|"CET-1CEST,M3.5.0,M10.5.0/3";
-            prefs.begin("peristaltica",false); prefs.putString("timezone",tz); prefs.end();
+            PREFS_LOCK();
+            prefs.begin("peristaltica",false);
+            prefs.putString("timezone",tz);
+            prefs.end();
+            PREFS_UNLOCK();
             setenv("TZ",tz.c_str(),1); tzset();
             req->send(200,"application/json","{\"ok\":true}");
         }
@@ -1180,10 +1311,10 @@ void onMqttMessage(char*,char* payload,AsyncMqttClientMessageProperties,size_t l
     StaticJsonDocument<256> doc;
     if(deserializeJson(doc,payload,len))return;
     const char* action=doc["action"]|""; int ch=doc["channel"]|0;
-    if(String(action)=="run") doRun(ch,doc["volume"]|0.0f,doc["speed"]|0.0f,doc["direction"]|"cw");
-    else if(String(action)=="stop") doStop(ch);
-    else if(String(action)=="calibrate") doCalibrate(ch,doc["stepsperml"]|1600L);
-    else if(String(action)=="params"){
+    if(!strcmp(action,"run")) doRun(ch,doc["volume"]|0.0f,doc["speed"]|0.0f,doc["direction"]|"cw");
+    else if(!strcmp(action,"stop")) doStop(ch);
+    else if(!strcmp(action,"calibrate")) doCalibrate(ch,doc["stepsperml"]|1600L);
+    else if(!strcmp(action,"params")){
         char buf[128];StaticJsonDocument<128>r;
         r["action"]="params";r["type"]="done";r["spm1"]=StepsPerMili1;r["spm2"]=StepsPerMili2;r["spm3"]=StepsPerMili3;
         serializeJson(r,buf);mqttClient.publish("peristaltica/status",1,true,buf);
@@ -1196,6 +1327,10 @@ void onMqttMessage(char*,char* payload,AsyncMqttClientMessageProperties,size_t l
 // =========================================================
 
 void reconnectWifi() { WiFi.reconnect(); }
+
+// Proper TimerCallbackFunction_t wrappers (avoid reinterpret_cast UB)
+static void mqttTimerCb(TimerHandle_t) { connectToMqtt(); }
+static void wifiTimerCb(TimerHandle_t) { reconnectWifi(); }
 
 void WiFiEvent(WiFiEvent_t event) {
     switch(event){
@@ -1213,6 +1348,10 @@ void WiFiEvent(WiFiEvent_t event) {
 // =========================================================
 
 void core0assignments(void*) {
+    // Detach this task from the IDLE-task watchdog: BLE scans and OTA can
+    // exceed the 5s timeout on Core 0. (Replacement for deprecated
+    // disableCore0WDT() which was removed in arduino-esp32 3.x.)
+    esp_task_wdt_delete(NULL);
     for (;;) {
         ArduinoOTA.handle();
         if (bleScanReq) { bleScanReq=false; doBleScan(); }
@@ -1237,21 +1376,21 @@ void StepperSetup() {
     stepper1.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
     stepper1.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
     stepper1.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper1);
-    stepper1.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
+    stepper1.registerEmergencyStopTriggeredCallback(emergencyStopCallback1);
 
     stepper2.connectToPins(Step2,Dir2);
     stepper2.setSpeedInStepsPerSecond(SPEED_IN_STEPS_PER_SECOND);
     stepper2.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
     stepper2.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
     stepper2.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper2);
-    stepper2.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
+    stepper2.registerEmergencyStopTriggeredCallback(emergencyStopCallback2);
 
     stepper3.connectToPins(Step3,Dir3);
     stepper3.setSpeedInStepsPerSecond(SPEED_IN_STEPS_PER_SECOND);
     stepper3.setAccelerationInStepsPerSecondPerSecond(ACCELERATION_IN_STEPS_PER_SECOND);
     stepper3.setDecelerationInStepsPerSecondPerSecond(DECELERATION_IN_STEPS_PER_SECOND);
     stepper3.registerTargetPositionReachedCallback(targetPositionReachedCallbackStepper3);
-    stepper3.registerEmergencyStopTriggeredCallback(emergencyStopTriggerdCallbackFunction);
+    stepper3.registerEmergencyStopTriggeredCallback(emergencyStopCallback3);
 
     stepper1.startAsService(1);
     stepper2.startAsService(1);
@@ -1282,13 +1421,14 @@ void EepromRead() {
 void setup() {
     Serial.begin(115200);
 
-    disableCore0WDT(); // OTA + BLE scan can take >10s on Core 0
+    // Mutexes must exist before any task can take them
+    prefsMutex  = xSemaphoreCreateMutex();
+    sensorMutex = xSemaphoreCreateMutex();
+
     xTaskCreatePinnedToCore(core0assignments,"Core_0",10000,NULL,1,&C0,0);
 
-    mqttReconnectTimer=xTimerCreate("mqttTimer",pdMS_TO_TICKS(2000),pdFALSE,(void*)0,
-        reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
-    wifiReconnectTimer=xTimerCreate("wifiTimer",pdMS_TO_TICKS(2000),pdFALSE,(void*)0,
-        reinterpret_cast<TimerCallbackFunction_t>(reconnectWifi));
+    mqttReconnectTimer=xTimerCreate("mqttTimer",pdMS_TO_TICKS(2000),pdFALSE,(void*)0,mqttTimerCb);
+    wifiReconnectTimer=xTimerCreate("wifiTimer",pdMS_TO_TICKS(2000),pdFALSE,(void*)0,wifiTimerCb);
 
     WiFi.onEvent(WiFiEvent);
 
